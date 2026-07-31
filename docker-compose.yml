@@ -1,0 +1,65 @@
+# `docker compose up --build` levanta la app + Postgres en local sin tocar nada
+# más. Las claves de API son opcionales: sin ellas la app arranca, pero la
+# transcripción fallará al llegar al proveedor STT.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: transcriptor
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d transcriptor']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  web:
+    build:
+      context: .
+      args:
+        # Se inyecta en el bundle del cliente en tiempo de build.
+        NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/transcriptor
+      DATA_DIR: /data
+
+      STT_PROVIDER: ${STT_PROVIDER:-groq}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLEANUP_MODEL: ${CLEANUP_MODEL:-claude-haiku-4-5}
+      SUMMARY_MODEL: ${SUMMARY_MODEL:-claude-sonnet-5}
+      ENABLE_CLEANUP: ${ENABLE_CLEANUP:-true}
+
+      CHUNK_SECONDS: ${CHUNK_SECONDS:-600}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-500}
+
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+    ports:
+      - '3000:3000'
+    volumes:
+      - audiodata:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+
+volumes:
+  pgdata:
+  audiodata:
