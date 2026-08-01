@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useId, useRef } from 'react';
+import { useCallback, useEffect, useId, useRef } from 'react';
 
 interface TurnstileRenderOptions {
   sitekey: string;
@@ -31,6 +31,14 @@ const SCRIPT_SRC =
 interface TurnstileProps {
   siteKey: string | null;
   onToken: (token: string | null) => void;
+  /**
+   * Contador: cada incremento fuerza un token nuevo.
+   *
+   * Los tokens de Turnstile son de **un solo uso** y caducan a los 300 s. Tras
+   * consumir uno en una subida hay que pedir otro, o la siguiente petición
+   * recibe `timeout-or-duplicate` y el servidor responde 403.
+   */
+  resetSignal?: number;
 }
 
 /**
@@ -40,7 +48,11 @@ interface TurnstileProps {
  * al padre con `null`: el servidor también salta la verificación cuando falta
  * `TURNSTILE_SECRET_KEY`.
  */
-export function Turnstile({ siteKey, onToken }: TurnstileProps): React.JSX.Element | null {
+export function Turnstile({
+  siteKey,
+  onToken,
+  resetSignal = 0,
+}: TurnstileProps): React.JSX.Element | null {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const widgetIdRef = useRef<string | null>(null);
   const onTokenRef = useRef(onToken);
@@ -49,6 +61,26 @@ export function Turnstile({ siteKey, onToken }: TurnstileProps): React.JSX.Eleme
   useEffect(() => {
     onTokenRef.current = onToken;
   }, [onToken]);
+
+  /** Pide un token nuevo al widget ya renderizado. */
+  const resetWidget = useCallback(() => {
+    const api = window.turnstile;
+    const widgetId = widgetIdRef.current;
+    if (!api || widgetId === null) return;
+    try {
+      api.reset(widgetId);
+    } catch {
+      // El widget aún no está listo; el siguiente render lo resolverá.
+    }
+  }, []);
+
+  // Tras consumir un token en una subida, el padre incrementa `resetSignal`
+  // para que el widget emita otro.
+  useEffect(() => {
+    if (resetSignal === 0) return;
+    onTokenRef.current(null);
+    resetWidget();
+  }, [resetSignal, resetWidget]);
 
   useEffect(() => {
     if (!siteKey) return;
@@ -66,7 +98,12 @@ export function Turnstile({ siteKey, onToken }: TurnstileProps): React.JSX.Eleme
         theme: 'dark',
         size: 'flexible',
         callback: (token: string) => onTokenRef.current(token),
-        'expired-callback': () => onTokenRef.current(null),
+        'expired-callback': () => {
+          // Caducó: invalidamos el token y pedimos otro, o el botón de subir
+          // se quedaría bloqueado para siempre.
+          onTokenRef.current(null);
+          resetWidget();
+        },
         'error-callback': () => onTokenRef.current(null),
       });
     };
@@ -98,7 +135,7 @@ export function Turnstile({ siteKey, onToken }: TurnstileProps): React.JSX.Eleme
       }
       widgetIdRef.current = null;
     };
-  }, [siteKey]);
+  }, [siteKey, resetWidget]);
 
   if (!siteKey) return null;
 

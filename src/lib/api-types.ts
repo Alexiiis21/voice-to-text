@@ -21,7 +21,18 @@ export interface ChunkView {
   startSec: number;
   endSec: number;
   attempts: number;
+  sttProvider: string | null;
   error: string | null;
+}
+
+/** Motor de transcripción ofrecido en el selector del panel de entrada. */
+export interface ProviderInfo {
+  name: 'groq' | 'openai';
+  label: string;
+  model: string;
+  /** true si su clave de API está definida en el servidor. */
+  available: boolean;
+  pricePerAudioHourUsd: number;
 }
 
 export interface TranscriptionView {
@@ -35,6 +46,8 @@ export interface TranscriptionView {
   wordCount: number | null;
   costUsd: number;
   error: string | null;
+  /** Si está aparcada por falta de cuota, cuándo se reanuda. */
+  resumeAfter: string | null;
   createdAt: string;
   startedAt: string | null;
   completedAt: string | null;

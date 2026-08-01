@@ -57,6 +57,11 @@ export function ProgressPanel({ transcription, chunks }: ProgressPanelProps): Re
   const settled = done + failed;
   const percent = total > 0 ? Math.round((settled / total) * 100) : 0;
   const active = ACTIVE_STATUSES.has(transcription.status);
+  // Aparcada por falta de cuota en el proveedor: no es un fallo, es una espera.
+  const waiting =
+    transcription.status === 'queued' &&
+    transcription.resumeAfter !== null &&
+    new Date(transcription.resumeAfter).getTime() > Date.now();
 
   return (
     <Panel label="FRAGMENTOS" active={active}>
@@ -68,7 +73,9 @@ export function ProgressPanel({ transcription, chunks }: ProgressPanelProps): Re
             aria-live="polite"
             aria-atomic="true"
           >
-            {STATUS_LABEL[transcription.status] ?? transcription.status.toUpperCase()}
+            {waiting
+              ? 'ESPERANDO CUOTA'
+              : (STATUS_LABEL[transcription.status] ?? transcription.status.toUpperCase())}
           </p>
         </div>
         <div className="text-right">
@@ -137,7 +144,16 @@ export function ProgressPanel({ transcription, chunks }: ProgressPanelProps): Re
       </div>
 
       {transcription.error && (
-        <p className="mt-3 border border-accent-to/40 bg-accent-to/[0.06] p-3 text-sm text-fg-muted">
+        <p
+          className={[
+            'mt-3 border p-3 text-sm text-fg-muted',
+            waiting
+              ? 'border-white/[0.14] bg-white/[0.03]'
+              : 'border-accent-to/40 bg-accent-to/[0.06]',
+          ].join(' ')}
+          role="status"
+        >
+          {waiting && <span className="micro mr-2">EN ESPERA</span>}
           {transcription.error}
         </p>
       )}

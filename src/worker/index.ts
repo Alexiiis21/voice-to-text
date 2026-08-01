@@ -10,7 +10,7 @@ import { env } from '@/lib/env';
 import { ensureDataDirs, removeTranscriptionFiles } from '@/lib/files';
 import { sql } from '@/db';
 import * as repo from './repo';
-import { JobInterrupted, processJob, type StopSignal } from './process';
+import { JobDeferred, JobInterrupted, processJob, type StopSignal } from './process';
 import { maybeRunRetentionSweep } from './retention';
 
 let shuttingDown = false;
@@ -42,6 +42,10 @@ async function tick(): Promise<boolean> {
       // Apagado limpio: nada debe quedarse colgado en `processing`.
       console.log(`[worker] ${job.id} devuelto a la cola por apagado`);
       await repo.requeue(job.id);
+    } else if (error instanceof JobDeferred) {
+      // Sin cuota en ningún proveedor: se aparca, no se falla. Los ficheros
+      // NO se borran: el trabajo continuará desde el fragmento pendiente.
+      await repo.deferJob(job.id, error.resumeAfter, error.reason);
     } else {
       const message = errorMessage(error);
       console.error(`[worker] ${job.id} falló: ${message}`);

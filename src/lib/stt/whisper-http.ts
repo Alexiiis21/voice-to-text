@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { SttError, type TranscribeResult } from './types';
+import { parseHumanDuration, parseRetryAfterSeconds } from './retry';
+import { SttError, type SttProviderName, type TranscribeResult } from './types';
 
 export interface WhisperHttpOptions {
+  provider: SttProviderName;
   endpoint: string;
   apiKey: string;
   model: string;
@@ -13,7 +15,7 @@ export interface WhisperHttpOptions {
 
 interface WhisperResponse {
   text?: string;
-  error?: { message?: string };
+  error?: { message?: string; code?: string; type?: string };
 }
 
 /**
@@ -52,7 +54,13 @@ export async function transcribeViaHttp(
     const message = error instanceof Error ? error.message : String(error);
     // Aborto explícito del apagado limpio: no reintentar.
     const aborted = signal?.aborted === true;
-    throw new SttError(`Error de red hablando con el proveedor STT: ${message}`, null, !aborted);
+    throw new SttError(
+      `Error de red hablando con ${options.provider}: ${message}`,
+      null,
+      aborted ? 'fatal' : 'transient',
+      null,
+      options.provider,
+    );
   }
 
   const bodyText = await response.text();
@@ -65,19 +73,55 @@ export async function transcribeViaHttp(
     } catch {
       // Se queda el texto crudo recortado.
     }
-    const retryable = response.status === 429 || response.status >= 500;
-    throw new SttError(`STT ${response.status}: ${detail}`, response.status, retryable);
+
+    if (response.status === 429) {
+      // Groq indica el tiempo restante en `retry-after`, y cuando no está,
+      // dentro del mensaje ("Please try again in 2m59.56s").
+      const retryAfter =
+        parseRetryAfterSeconds(response.headers.get('retry-after')) ??
+        parseHumanDuration(/try again in ([\dhms.]+)/i.exec(detail)?.[1]);
+
+      throw new SttError(
+        `Cuota de ${options.provider} agotada: ${detail}`,
+        429,
+        'quota',
+        retryAfter,
+        options.provider,
+      );
+    }
+
+    // 5xx y 408 se reintentan; el resto (401, 400, 413…) no se arregla solo.
+    const kind = response.status >= 500 || response.status === 408 ? 'transient' : 'fatal';
+    throw new SttError(
+      `${options.provider} respondió ${response.status}: ${detail}`,
+      response.status,
+      kind,
+      parseRetryAfterSeconds(response.headers.get('retry-after')),
+      options.provider,
+    );
   }
 
   let parsed: WhisperResponse;
   try {
     parsed = JSON.parse(bodyText) as WhisperResponse;
   } catch {
-    throw new SttError('El proveedor STT devolvió una respuesta ilegible', response.status, true);
+    throw new SttError(
+      `${options.provider} devolvió una respuesta ilegible`,
+      response.status,
+      'transient',
+      null,
+      options.provider,
+    );
   }
 
   if (typeof parsed.text !== 'string') {
-    throw new SttError('La respuesta del proveedor STT no incluye texto', response.status, true);
+    throw new SttError(
+      `La respuesta de ${options.provider} no incluye texto`,
+      response.status,
+      'transient',
+      null,
+      options.provider,
+    );
   }
 
   return { text: parsed.text.trim() };

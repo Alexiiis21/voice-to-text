@@ -1,6 +1,7 @@
 import { Transcriber } from '@/components/transcriber';
 import { WORKER } from '@/lib/config';
 import { env } from '@/lib/env';
+import { defaultProviderName, listProviders } from '@/lib/stt';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,6 +17,8 @@ export default function HomePage(): React.JSX.Element {
       maxUploadMb={env.maxUploadMb}
       cleanupEnabledByDefault={env.enableCleanup}
       retentionDays={WORKER.retentionDays}
+      providers={listProviders()}
+      defaultProvider={defaultProviderName()}
     />
   );
 }

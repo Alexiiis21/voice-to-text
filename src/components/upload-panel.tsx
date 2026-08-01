@@ -5,12 +5,16 @@ import { Panel } from './panel';
 import { Progress } from '@/components/ui/progress';
 import { ALLOWED_EXTENSIONS_LABEL } from '@/lib/client-config';
 import { formatBytes, formatDuration } from '@/lib/utils';
+import type { ProviderInfo } from '@/lib/api-types';
 
 interface UploadPanelProps {
   busy: boolean;
   uploadPercent: number | null;
   disabledReason: string | null;
   maxUploadMb: number;
+  providers: ProviderInfo[];
+  provider: string;
+  onProviderChange: (name: string) => void;
   onSubmit: (file: File) => void;
 }
 
@@ -19,6 +23,9 @@ export function UploadPanel({
   uploadPercent,
   disabledReason,
   maxUploadMb,
+  providers,
+  provider,
+  onProviderChange,
   onSubmit,
 }: UploadPanelProps): React.JSX.Element {
   const [file, setFile] = useState<File | null>(null);
@@ -160,6 +167,53 @@ export function UploadPanel({
             <span className="micro">{uploadPercent}%</span>
           </div>
           <Progress value={uploadPercent} aria-label="Progreso de la subida" />
+        </div>
+      )}
+
+      {/* Selector de motor. Los proveedores sin clave en el servidor se
+          muestran desactivados: la interfaz no puede forzar uno sin credencial. */}
+      {providers.length > 0 && (
+        <div className="mt-4">
+          <p className="micro mb-2" id="motor-label">
+            MOTOR DE TRANSCRIPCIÓN
+          </p>
+          <div
+            role="radiogroup"
+            aria-labelledby="motor-label"
+            className="inline-flex border border-line"
+          >
+            {providers.map((item) => {
+              const selected = item.name === provider;
+              return (
+                <button
+                  key={item.name}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  disabled={!item.available || busy}
+                  onClick={() => onProviderChange(item.name)}
+                  title={
+                    item.available
+                      ? `${item.model} · ~$${item.pricePerAudioHourUsd.toFixed(2)}/hora de audio`
+                      : `Falta la clave de API de ${item.label} en el servidor`
+                  }
+                  className={[
+                    'font-mono text-[11px] uppercase tracking-micro px-4 py-2',
+                    'border-r border-line last:border-r-0 transition-colors',
+                    'disabled:opacity-30 disabled:pointer-events-none',
+                    selected ? 'bg-ink-950 text-fg' : 'text-fg-faint hover:text-fg-muted',
+                  ].join(' ')}
+                >
+                  {item.label}
+                </button>
+              );
+            })}
+          </div>
+          <p className="mt-2 text-xs text-fg-faint">
+            {providers.filter((item) => item.available).length > 1
+              ? 'Si el motor elegido se queda sin cuota a mitad, los fragmentos restantes pasan al otro automáticamente.'
+              : 'Sin cuota, el trabajo se aparca y se reanuda solo cuando la ventana se abre.'}
+          </p>
         </div>
       )}
 

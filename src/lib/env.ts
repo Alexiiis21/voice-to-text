@@ -39,15 +39,30 @@ function bool(name: string, fallback: boolean): boolean {
 
 export type SttProviderName = 'groq' | 'openai';
 
-function sttProvider(): SttProviderName {
+/**
+ * `STT_PROVIDER` acepta una lista ordenada separada por comas
+ * (`groq,openai`): el primero es el proveedor por defecto y los siguientes son
+ * el desbordamiento cuando el anterior se queda sin cuota. Un valor único
+ * (`groq`) sigue siendo válido y significa "sin desbordamiento".
+ */
+function sttProviders(): SttProviderName[] {
   const raw = (process.env.STT_PROVIDER ?? 'groq').toLowerCase();
-  if (raw !== 'groq' && raw !== 'openai') {
-    throw new Error(`STT_PROVIDER debe ser 'groq' u 'openai', se recibió: ${raw}`);
+  const out: SttProviderName[] = [];
+
+  for (const part of raw.split(',').map((value) => value.trim()).filter(Boolean)) {
+    if (part !== 'groq' && part !== 'openai') {
+      throw new Error(
+        `STT_PROVIDER sólo admite 'groq' y 'openai' separados por comas, se recibió: ${part}`,
+      );
+    }
+    if (!out.includes(part)) out.push(part);
   }
-  return raw;
+
+  return out.length > 0 ? out : ['groq'];
 }
 
-const provider = sttProvider();
+const providers = sttProviders();
+const provider = providers[0] ?? 'groq';
 
 /**
  * `next build` importa los módulos de las rutas para recolectar metadatos, y
@@ -64,6 +79,9 @@ export const env = {
   ),
   dataDir: str('DATA_DIR', '/data'),
 
+  /** Cadena ordenada: primario y desbordamientos. */
+  sttProviders: providers,
+  /** Primer proveedor de la cadena. */
   sttProvider: provider,
   groqApiKey: optional('GROQ_API_KEY'),
   openaiApiKey: optional('OPENAI_API_KEY'),

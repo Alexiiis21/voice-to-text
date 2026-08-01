@@ -48,6 +48,12 @@ export const transcriptions = pgTable(
     wordCount: integer('word_count'),
     costUsd: numeric('cost_usd', { precision: 10, scale: 5 }).notNull().default('0'),
     error: text('error'),
+    /**
+     * No reclamar antes de esta marca. Se rellena cuando todos los proveedores
+     * STT están sin cuota: el trabajo vuelve a `queued` y el worker sigue con
+     * otros en vez de bloquearse esperando a que se abra la ventana horaria.
+     */
+    resumeAfter: timestamp('resume_after', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     startedAt: timestamp('started_at', { withTimezone: true }),
     completedAt: timestamp('completed_at', { withTimezone: true }),
@@ -73,6 +79,9 @@ export const chunks = pgTable(
     /** true si este fragmento arranca con 1,5 s de solape sobre el anterior. */
     hasOverlap: boolean('has_overlap').notNull().default(false),
     status: chunkStatusEnum('status').notNull().default('pending'),
+    /** Proveedor que transcribió realmente este fragmento (puede diferir del
+     *  pedido si hubo desbordamiento por cuota). */
+    sttProvider: text('stt_provider'),
     rawText: text('raw_text'),
     cleanText: text('clean_text'),
     attempts: integer('attempts').notNull().default(0),

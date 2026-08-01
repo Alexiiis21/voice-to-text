@@ -15,6 +15,7 @@ bajo demanda).
 1. [Arranque rápido en local](#1-arranque-rápido-en-local)
 2. [Arquitectura](#2-arquitectura)
 3. [Dos procesos en un servicio](#3-dos-procesos-en-un-servicio)
+   · [Cuotas: desbordamiento y reanudación](#3bis-cuotas-del-proveedor-desbordamiento-y-reanudación)
 4. [El troceado, en detalle](#4-el-troceado-en-detalle)
 5. [Cómo obtener cada API key](#5-cómo-obtener-cada-api-key)
 6. [Despliegue en Railway, paso a paso](#6-despliegue-en-railway-paso-a-paso)
@@ -131,6 +132,70 @@ que encuentre en `processing` o `editing`.
 
 ---
 
+## 3.bis Cuotas del proveedor: desbordamiento y reanudación
+
+El tier gratuito de Groq admite **7.200 segundos de audio por hora** (2 h) y
+**28.800 al día** (8 h). Un audio de tres horas son 10.800 segundos: **no cabe
+en una sola ventana horaria**. La app está construida para que eso no sea un
+problema, con dos mecanismos que se combinan.
+
+### Desbordamiento entre proveedores
+
+`STT_PROVIDER` acepta una lista ordenada: `groq,openai`. El primero es el motor
+por defecto; los siguientes absorben lo que el anterior no puede.
+
+Cuando un fragmento recibe un `429` por cuota, **no se gastan reintentos**: se
+salta de inmediato al siguiente proveedor de la cadena. Solo si todos están sin
+cuota se pasa al segundo mecanismo.
+
+> **La presencia de la clave es el interruptor.** Si defines `OPENAI_API_KEY`,
+> OpenAI entra en la cadena aunque no lo añadas a `STT_PROVIDER`. Si no la
+> defines, Groq trabaja solo. No hay que tocar código para cambiar de modo.
+
+El usuario puede elegir el motor por transcripción desde el **selector del panel
+de entrada** (`MOTOR DE TRANSCRIPCIÓN`). Ese motor pasa a la cabeza de la cadena;
+los demás quedan detrás como desbordamiento. Los proveedores sin clave en el
+servidor se muestran desactivados: la interfaz no puede forzar uno sin
+credencial. El proveedor que transcribió realmente cada fragmento se guarda en
+`chunks.stt_provider`, así que el coste se calcula con la tarifa correcta aunque
+un mismo audio se haya repartido entre dos motores.
+
+### Reanudación automática
+
+Si toda la cadena está sin cuota, el trabajo **no falla**: vuelve a `queued` con
+una marca `resume_after` y el worker sigue atendiendo otros. La consulta de
+reclamo lo ignora hasta que llega la hora:
+
+```sql
+WHERE status = 'queued' AND (resume_after IS NULL OR resume_after <= now())
+```
+
+Los fragmentos ya transcritos están en `chunks`, así que al reanudarse continúa
+donde lo dejó y **no se vuelve a pagar** lo ya hecho. El audio tampoco se borra
+mientras el trabajo está aparcado. Un audio de tres horas se completa solo a lo
+largo de dos ventanas horarias, sin que el usuario intervenga.
+
+La espera sale de la cabecera `Retry-After`; Groq a veces la manda en el cuerpo
+del error (`"try again in 2m59.56s"`) y también se parsea. Si no viene ninguna,
+se asume un cuarto de hora. Todo esto vive en `src/lib/stt/retry.ts`, que es
+puro y está cubierto por tests.
+
+En la interfaz el estado se muestra como **ESPERANDO CUOTA**, con la hora
+estimada de reanudación y cuántos fragmentos van hechos. No es un error y no se
+presenta como tal.
+
+### Clasificación de errores
+
+Distinguir "espera" de "fallo" es lo que hace que todo esto funcione:
+
+| Respuesta | Clase | Reacción |
+|---|---|---|
+| 5xx, 408, timeout, red caída | `transient` | Reintentar con el mismo proveedor: backoff exponencial 1 s → 2 s → 4 s, con tope de 30 s |
+| `429` | `quota` | Saltar al siguiente proveedor sin gastar intentos; si no hay más, aparcar el trabajo |
+| 401, 400, 413 y demás 4xx | `fatal` | No reintentar: no se arregla solo. Se pasa al siguiente proveedor por si el problema es de credenciales de uno solo |
+
+---
+
 ## 4. El troceado, en detalle
 
 El troceado ya no es necesario por límites de plataforma —Railway no tiene tope
@@ -171,9 +236,11 @@ de body ni timeout—, sino por tres motivos:
    palabras: una sola palabra repetida es demasiado común en español para
    servir de evidencia.
 
-Las dos piezas con lógica no trivial —el cálculo de puntos de corte a partir de
-`silencedetect` y la eliminación de duplicados en los solapes— son módulos puros
-y están cubiertas por tests: `tests/silence.test.ts` y `tests/overlap.test.ts`.
+Las piezas con lógica no trivial son módulos puros y están cubiertas por tests:
+el cálculo de puntos de corte a partir de `silencedetect`
+(`tests/silence.test.ts`), la eliminación de duplicados en los solapes
+(`tests/overlap.test.ts`) y la política de espera frente a las cuotas del
+proveedor (`tests/stt-retry.test.ts`).
 
 ```bash
 npm test
@@ -189,16 +256,30 @@ npm test
 2. **API Keys** → **Create API Key**. Copia el valor (empieza por `gsk_`).
 3. `GROQ_API_KEY=gsk_…`
 
-Modelo usado: `whisper-large-v3-turbo`. Groq tiene un plan gratuito con límites
-de peticiones por minuto generosos para este caso de uso.
+Modelo usado: `whisper-large-v3-turbo`.
 
-### OpenAI (alternativa de speech-to-text)
+**El tier gratuito basta para un uso normal** y no hace falta el plan Developer:
+
+| Límite (free tier) | Valor | Qué significa aquí |
+|---|---|---|
+| Peticiones/minuto | 20 | Irrelevante: un fragmento de 10 min es 1 petición |
+| Peticiones/día | 2.000 | Irrelevante |
+| **Audio seg/hora** | **7.200** | 2 h de audio por hora |
+| **Audio seg/día** | **28.800** | 8 h de audio por día |
+
+Si el upgrade al plan Developer aparece como *temporarily unavailable*, no es un
+bloqueo: la app está diseñada para trabajar dentro de estos límites y reanudarse
+sola cuando se agotan. Ver [§3.bis](#3bis-cuotas-del-proveedor-desbordamiento-y-reanudación).
+
+### OpenAI (desbordamiento, o alternativa completa)
 
 1. <https://platform.openai.com/api-keys> → **Create new secret key**.
-2. `OPENAI_API_KEY=sk-…` y `STT_PROVIDER=openai`.
-3. Con OpenAI, baja `CHUNK_SECONDS` a `300`.
+2. `OPENAI_API_KEY=sk-…`
 
-Modelo usado: `whisper-1`.
+Modelo usado: `whisper-1`. Con solo definir la clave, OpenAI entra en la cadena
+como desbordamiento: absorbe los fragmentos que Groq no puede transcribir por
+falta de cuota, y **solo se paga por esos**. Para usarlo como motor principal,
+pon `STT_PROVIDER=openai,groq` o elígelo en el selector de la interfaz.
 
 ### Anthropic (edición y resumen)
 
@@ -387,9 +468,9 @@ Ver `.env.example`. Ninguna clave secreta acaba en el bundle del cliente: la
 |---|---|---|---|
 | `DATABASE_URL` | Sí | — | La inyecta Railway |
 | `DATA_DIR` | No | `/data` | Punto de montaje del volumen |
-| `STT_PROVIDER` | No | `groq` | `groq` \| `openai` |
-| `GROQ_API_KEY` | Si `STT_PROVIDER=groq` | — | |
-| `OPENAI_API_KEY` | Si `STT_PROVIDER=openai` | — | |
+| `STT_PROVIDER` | No | `groq` | Lista ordenada: primario y desbordamientos (`groq,openai`) |
+| `GROQ_API_KEY` | Al menos una de las dos | — | Define la clave y el proveedor entra en la cadena |
+| `OPENAI_API_KEY` | Al menos una de las dos | — | Idem; sin ella no hay desbordamiento |
 | `ANTHROPIC_API_KEY` | No | — | Sin ella sólo hay salida CRUDA |
 | `CLEANUP_MODEL` | No | `claude-haiku-4-5` | |
 | `SUMMARY_MODEL` | No | `claude-sonnet-5` | |
@@ -449,11 +530,17 @@ y seguir adelante dejándolo anotado. Esto es lo que hay:
    explícitamente (`thinking: { type: 'disabled' }`) y se sube el techo a 8000.
    El prompt de sistema es literalmente el de la especificación.
 
-2. **Dos columnas añadidas al esquema de §3.**
+2. **Cuatro columnas añadidas al esquema de §3.**
    - `transcriptions.source_ext`: la extensión validada por el servidor. Sin
      ella no hay forma de localizar el fichero en disco sin usar el nombre que
      envía el cliente, que es exactamente lo que la especificación prohíbe.
-   - `rate_limits.audio_seconds`: el límite de "6 horas de audio por hora" no es
+   - `transcriptions.resume_after`: marca hasta la que no se reclama el trabajo.
+     Es lo que permite aparcar y reanudar cuando el proveedor STT se queda sin
+     cuota, en vez de fallar.
+   - `chunks.stt_provider`: qué proveedor transcribió realmente cada fragmento.
+     Con desbordamiento, un mismo audio puede repartirse entre dos motores con
+     tarifas distintas, y `cost_usd` tiene que reflejarlo.
+   - `rate_limits.audio_seconds`: el límite de "N horas de audio por hora" no es
      computable con las columnas de §3, que sólo tienen `count`.
 
    También hay una tabla `worker_state` (una fila) para la marca de tiempo del
@@ -486,7 +573,20 @@ y seguir adelante dejándolo anotado. Esto es lo que hay:
    (`NEXT_PHASE === 'phase-production-build'`) y usa un placeholder que nunca
    llega a abrir una conexión.
 
-8. **Las fechas van como texto ISO en las consultas SQL crudas.** El cliente de
+8. **El rate limit por IP baja de 6 h a 2 h de audio por hora.** §5 pedía 6 h,
+   pero el tier gratuito de Groq admite 7.200 s (2 h) de audio por hora **en
+   total**, no por IP. Aceptar 6 h/hora significaba admitir trabajo que el
+   proveedor no puede completar dentro de la ventana. Si configuras
+   desbordamiento a OpenAI, se puede volver a subir en
+   `RATE_LIMIT.maxAudioSeconds` (`src/lib/config.ts`).
+
+9. **Un 429 de cuota no es un fallo.** El backoff exponencial original
+   (1 s / 2 s / 4 s) agotaba los tres intentos en segundos contra una cuota
+   **horaria**, y marcaba el fragmento como fallido. Ahora los errores se
+   clasifican en `transient` / `quota` / `fatal` y cada clase tiene su reacción.
+   Ver [§3.bis](#3bis-cuotas-del-proveedor-desbordamiento-y-reanudación).
+
+10. **Las fechas van como texto ISO en las consultas SQL crudas.** El cliente de
    postgres.js se configura con `prepare: false` para ser compatible con
    poolers en modo *transaction*. En ese modo postgres.js delega la inferencia
    de tipos al servidor y **no sabe serializar un objeto `Date`**: revienta con
@@ -573,7 +673,10 @@ src/
 │  ├─ silence.ts              Puntos de corte (puro, testeado)
 │  ├─ overlap.ts              Dedupe de solapes (puro, testeado)
 │  ├─ ffmpeg.ts               ffprobe, silencedetect, normalización, extracción
-│  ├─ stt/                    Adaptador intercambiable Groq/OpenAI
+│  ├─ stt/                    Cadena de proveedores Groq/OpenAI
+│  │  ├─ retry.ts             Política de espera ante cuotas (puro, testeado)
+│  │  ├─ whisper-http.ts      Cliente común + clasificación de errores
+│  │  └─ index.ts             Registro, disponibilidad y resolución de cadena
 │  ├─ claude.ts               Edición y resumen
 │  ├─ upload.ts               Multipart en streaming a disco (busboy)
 │  ├─ rate-limit.ts turnstile.ts session.ts cost.ts files.ts

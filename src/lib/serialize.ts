@@ -7,6 +7,7 @@ export interface ChunkView {
   startSec: number;
   endSec: number;
   attempts: number;
+  sttProvider: string | null;
   error: string | null;
 }
 
@@ -21,6 +22,8 @@ export interface TranscriptionView {
   wordCount: number | null;
   costUsd: number;
   error: string | null;
+  /** Si está aparcada por falta de cuota, cuándo se reanuda. */
+  resumeAfter: string | null;
   createdAt: string;
   startedAt: string | null;
   completedAt: string | null;
@@ -48,6 +51,7 @@ export function toView(row: Transcription): TranscriptionView {
     wordCount: row.wordCount,
     costUsd: parseCost(row.costUsd),
     error: row.error,
+    resumeAfter: row.resumeAfter?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
     startedAt: row.startedAt?.toISOString() ?? null,
     completedAt: row.completedAt?.toISOString() ?? null,
@@ -64,6 +68,7 @@ export function toChunkView(chunk: Chunk): ChunkView {
     startSec: Number.parseFloat(chunk.startSec),
     endSec: Number.parseFloat(chunk.endSec),
     attempts: chunk.attempts,
+    sttProvider: chunk.sttProvider,
     error: chunk.error,
   };
 }

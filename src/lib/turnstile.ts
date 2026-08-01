@@ -13,6 +13,33 @@ export interface TurnstileResult {
 }
 
 /**
+ * Traduce los códigos de siteverify a algo accionable.
+ *
+ * `timeout-or-duplicate` es con diferencia el más frecuente: los tokens son de
+ * un solo uso y caducan a los 300 s. El cliente pide uno nuevo tras cada
+ * subida, pero una pestaña abierta mucho rato o un doble envío pueden llegar
+ * aquí igualmente.
+ */
+function explainCodes(codes: readonly string[]): string {
+  if (codes.includes('timeout-or-duplicate')) {
+    return 'La verificación antibot ha caducado o ya se había usado. Recarga la página e inténtalo de nuevo.';
+  }
+  if (codes.includes('invalid-input-secret') || codes.includes('missing-input-secret')) {
+    return 'TURNSTILE_SECRET_KEY no es válida o falta en el servidor.';
+  }
+  if (codes.includes('invalid-input-response') || codes.includes('missing-input-response')) {
+    return 'No se recibió una respuesta válida del widget antibot.';
+  }
+  if (codes.includes('bad-request')) {
+    return 'Cloudflare rechazó la petición de verificación (bad-request).';
+  }
+  if (codes.includes('internal-error')) {
+    return 'Cloudflare tuvo un error interno verificando el token. Vuelve a intentarlo.';
+  }
+  return `Verificación antibot fallida (${codes.join(', ') || 'sin detalle'}).`;
+}
+
+/**
  * Verifica el token de Turnstile contra Cloudflare.
  *
  * Si `TURNSTILE_SECRET_KEY` no está definida, la verificación se salta y se
@@ -52,7 +79,7 @@ export async function verifyTurnstile(
     if (parsed.success === true) return { ok: true, reason: null };
 
     const codes = parsed['error-codes'] ?? [];
-    return { ok: false, reason: `Turnstile rechazó el token (${codes.join(', ') || 'sin detalle'})` };
+    return { ok: false, reason: explainCodes(codes) };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, reason: `No se pudo verificar Turnstile: ${message}` };

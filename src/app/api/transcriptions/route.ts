@@ -21,7 +21,7 @@ import {
 } from '@/lib/rate-limit';
 import { readSessionId } from '@/lib/session';
 import { toView } from '@/lib/serialize';
-import { activeSttProviderName } from '@/lib/stt';
+import { defaultProviderName, normalizeRequestedProvider } from '@/lib/stt';
 import { verifyTurnstile } from '@/lib/turnstile';
 import { parseUpload, UploadError } from '@/lib/upload';
 
@@ -73,6 +73,10 @@ export async function POST(request: Request): Promise<NextResponse> {
   const id = randomUUID();
   let destination: string | null = null;
   let reserved = false;
+  // Motor elegido en el selector del panel de entrada. Si el cliente manda
+  // algo que no está configurado en el servidor, se ignora y se usa el
+  // primero de la cadena: el cliente no puede forzar un proveedor sin clave.
+  let requestedProvider = defaultProviderName();
 
   try {
     const upload = await parseUpload(request.body, contentType, maxBytes, {
@@ -96,7 +100,10 @@ export async function POST(request: Request): Promise<NextResponse> {
           throw new UploadError(`Tipo MIME no permitido: ${normalizedMime}`, 400);
         }
 
-        // 3. Rate limit por IP.
+        // 3. Motor pedido (opcional).
+        requestedProvider = normalizeRequestedProvider(fields.sttProvider) ?? defaultProviderName();
+
+        // 4. Rate limit por IP.
         const decision = await reserveTranscription(ip);
         if (!decision.allowed) {
           throw new UploadError(decision.reason ?? 'Límite de uso alcanzado', 429);
@@ -143,7 +150,7 @@ export async function POST(request: Request): Promise<NextResponse> {
         sizeBytes: upload.bytesWritten,
         durationSec: Math.round(durationSec),
         status: 'queued',
-        sttProvider: activeSttProviderName(),
+        sttProvider: requestedProvider,
       })
       .returning();
 

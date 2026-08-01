@@ -15,10 +15,12 @@ export async function claimNextJob(): Promise<Transcription | null> {
     UPDATE transcriptions
     SET status = 'processing',
         started_at = COALESCE(started_at, now()),
+        resume_after = NULL,
         error = NULL
     WHERE id = (
       SELECT id FROM transcriptions
       WHERE status = 'queued'
+        AND (resume_after IS NULL OR resume_after <= now())
       ORDER BY created_at ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
@@ -50,6 +52,7 @@ function normalizeTranscription(row: Record<string, unknown>): Transcription {
     wordCount: row.word_count === null ? null : Number(row.word_count),
     costUsd: String(row.cost_usd),
     error: (row.error as string | null) ?? null,
+    resumeAfter: (row.resume_after as Date | null) ?? null,
     createdAt: row.created_at as Date,
     startedAt: (row.started_at as Date | null) ?? null,
     completedAt: (row.completed_at as Date | null) ?? null,
@@ -86,6 +89,18 @@ export async function requeue(id: string): Promise<void> {
   await db
     .update(transcriptions)
     .set({ status: 'queued', startedAt: null })
+    .where(eq(transcriptions.id, id));
+}
+
+/**
+ * Aparca un trabajo hasta `resumeAfter` porque no hay cuota en ningún
+ * proveedor. Vuelve a `queued` conservando `started_at` y los fragmentos ya
+ * transcritos: al reanudarse continúa donde lo dejó.
+ */
+export async function deferJob(id: string, resumeAfter: Date, reason: string): Promise<void> {
+  await db
+    .update(transcriptions)
+    .set({ status: 'queued', resumeAfter, error: reason.slice(0, 4000) })
     .where(eq(transcriptions.id, id));
 }
 
@@ -145,7 +160,9 @@ export async function insertChunks(
 
 export async function updateChunk(
   id: string,
-  values: Partial<Pick<Chunk, 'status' | 'rawText' | 'cleanText' | 'attempts' | 'error'>>,
+  values: Partial<
+    Pick<Chunk, 'status' | 'rawText' | 'cleanText' | 'attempts' | 'error' | 'sttProvider'>
+  >,
 ): Promise<void> {
   await db.update(chunks).set(values).where(eq(chunks.id, id));
 }

@@ -10,6 +10,7 @@ import { UploadPanel } from './upload-panel';
 import { Switch } from '@/components/ui/switch';
 import type {
   ChunkView,
+  ProviderInfo,
   QuotaSnapshot,
   TranscriptionDetail,
   TranscriptionView,
@@ -20,6 +21,8 @@ interface TranscriberProps {
   maxUploadMb: number;
   cleanupEnabledByDefault: boolean;
   retentionDays: number;
+  providers: ProviderInfo[];
+  defaultProvider: string;
 }
 
 const TERMINAL = new Set(['done', 'failed']);
@@ -29,6 +32,8 @@ export function Transcriber({
   maxUploadMb,
   cleanupEnabledByDefault,
   retentionDays,
+  providers,
+  defaultProvider,
 }: TranscriberProps): React.JSX.Element {
   const [detail, setDetail] = useState<TranscriptionDetail | null>(null);
   const [history, setHistory] = useState<TranscriptionView[]>([]);
@@ -37,6 +42,9 @@ export function Transcriber({
   const [busy, setBusy] = useState(false);
   const [notifyOnDone, setNotifyOnDone] = useState(false);
   const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  // Se incrementa tras cada subida: el token de Turnstile es de un solo uso.
+  const [turnstileNonce, setTurnstileNonce] = useState(0);
+  const [provider, setProvider] = useState(defaultProvider);
 
   const sourceRef = useRef<EventSource | null>(null);
   const notifyRef = useRef(false);
@@ -182,6 +190,7 @@ export function Transcriber({
       // El token va ANTES del fichero: el servidor lo verifica sin haber
       // escrito un solo byte en disco.
       if (turnstileToken) form.append('turnstileToken', turnstileToken);
+      form.append('sttProvider', provider);
       form.append('file', file, file.name);
 
       const xhr = new XMLHttpRequest();
@@ -195,6 +204,9 @@ export function Transcriber({
 
       xhr.addEventListener('load', () => {
         setUploadPercent(null);
+        // El token ya se ha gastado, con éxito o sin él: pedimos otro.
+        setTurnstileToken(null);
+        setTurnstileNonce((value) => value + 1);
 
         let payload: { id?: string; transcription?: TranscriptionView; quota?: QuotaSnapshot; error?: string } = {};
         try {
@@ -231,6 +243,8 @@ export function Transcriber({
       xhr.addEventListener('error', () => {
         setUploadPercent(null);
         setBusy(false);
+        setTurnstileToken(null);
+        setTurnstileNonce((value) => value + 1);
         toast.error('Error de red durante la subida');
       });
 
@@ -241,7 +255,15 @@ export function Transcriber({
 
       xhr.send(form);
     },
-    [closeStream, openStream, refreshHistory, refreshQuota, turnstileSiteKey, turnstileToken],
+    [
+      closeStream,
+      openStream,
+      provider,
+      refreshHistory,
+      refreshQuota,
+      turnstileSiteKey,
+      turnstileToken,
+    ],
   );
 
   const selectFromHistory = useCallback(
@@ -297,6 +319,9 @@ export function Transcriber({
             busy={busy}
             uploadPercent={uploadPercent}
             maxUploadMb={maxUploadMb}
+            providers={providers}
+            provider={provider}
+            onProviderChange={setProvider}
             disabledReason={
               remaining !== null && remaining <= 0
                 ? 'Has agotado los usos de esta hora.'
@@ -401,7 +426,11 @@ export function Transcriber({
 
           <div className="shrink-0">
             <p className="micro mb-2">VERIFICACIÓN</p>
-            <Turnstile siteKey={turnstileSiteKey} onToken={setTurnstileToken} />
+            <Turnstile
+              siteKey={turnstileSiteKey}
+              onToken={setTurnstileToken}
+              resetSignal={turnstileNonce}
+            />
             {!turnstileSiteKey && (
               <p className="text-xs text-fg-faint">
                 Turnstile no configurado (desarrollo local).

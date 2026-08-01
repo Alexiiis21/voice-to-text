@@ -40,11 +40,39 @@ export const ALLOWED_MIME_TYPES = new Set([
   'application/octet-stream',
 ]);
 
-/** Rate limit por IP y ventana de 1 hora (§5). */
+/**
+ * Rate limit por IP y ventana de 1 hora.
+ *
+ * §5 pedía 6 horas de audio por hora. Se ha bajado a 2 h porque el tier
+ * gratuito de Groq admite **7.200 segundos de audio por hora** en total (y
+ * 28.800 al día): aceptar 6 h/hora por IP significaba admitir trabajo que el
+ * proveedor no puede completar dentro de la ventana. Con desbordamiento a
+ * OpenAI configurado se puede volver a subir; ver README §11.
+ */
 export const RATE_LIMIT = {
   windowMs: 60 * 60 * 1000,
   maxTranscriptions: 10,
-  maxAudioSeconds: 6 * 60 * 60,
+  maxAudioSeconds: 2 * 60 * 60,
+} as const;
+
+/**
+ * Comportamiento frente a las cuotas del proveedor STT.
+ *
+ * Un 429 por cuota horaria no es un fallo: es una espera. Si la espera es
+ * corta, el worker duerme y sigue. Si es larga, devuelve el trabajo a la cola
+ * con una marca `resume_after` y atiende otros mientras tanto; los fragmentos
+ * ya transcritos quedan guardados, así que al reanudarse continúa donde lo
+ * dejó y un audio de tres horas se completa a través de varias ventanas.
+ */
+export const QUOTA = {
+  /** Por encima de esta espera, el trabajo se aparca en vez de bloquear. */
+  deferThresholdSec: 90,
+  /** Espera asumida cuando el proveedor no dice cuánto falta. */
+  defaultWaitSec: 15 * 60,
+  /** Tope de espera: nunca aparcamos un trabajo más de esto. */
+  maxWaitSec: 60 * 60,
+  /** Tope del backoff exponencial para errores transitorios. */
+  transientBackoffCapMs: 30_000,
 } as const;
 
 /** Troceado (§2). */

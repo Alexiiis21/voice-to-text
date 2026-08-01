@@ -31,7 +31,8 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/transcriptor
       DATA_DIR: /data
 
-      STT_PROVIDER: ${STT_PROVIDER:-groq}
+      # Lista ordenada: primario y desbordamiento por cuota.
+      STT_PROVIDER: ${STT_PROVIDER:-groq,openai}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
 

@@ -1,4 +1,4 @@
-import { CHUNKING, WORKER } from '@/lib/config';
+import { CHUNKING, QUOTA, WORKER } from '@/lib/config';
 import { env } from '@/lib/env';
 import {
   chunkPath,
@@ -12,7 +12,14 @@ import {
 import { detectSilences, extractChunk, normalizeAudio, probeAudio } from '@/lib/ffmpeg';
 import { computeCutPoints } from '@/lib/silence';
 import { joinChunkTexts } from '@/lib/overlap';
-import { getSttAdapter, SttError } from '@/lib/stt';
+import {
+  backoffDelayMs,
+  decideDeferral,
+  resolveSttChain,
+  SttError,
+  SttQuotaExhausted,
+  type SttAdapter,
+} from '@/lib/stt';
 import { sttCostUsd } from '@/lib/cost';
 import { anthropicConfigured, cleanupChunk } from '@/lib/claude';
 import type { Chunk, Transcription } from '@/db/schema';
@@ -27,6 +34,20 @@ export class JobInterrupted extends Error {
   constructor() {
     super('Trabajo interrumpido por apagado limpio');
     this.name = 'JobInterrupted';
+  }
+}
+
+/**
+ * El trabajo no puede continuar ahora porque no queda cuota en ningún
+ * proveedor, pero **no ha fallado**: se aparca y se reanuda solo.
+ */
+export class JobDeferred extends Error {
+  constructor(
+    readonly resumeAfter: Date,
+    readonly reason: string,
+  ) {
+    super(reason);
+    this.name = 'JobDeferred';
   }
 }
 
@@ -50,6 +71,7 @@ function errorMessage(error: unknown): string {
  * nunca se materializan los N fragmentos a la vez (§2, §12).
  */
 async function transcribeRange(
+  adapter: SttAdapter,
   transcriptionId: string,
   idx: number,
   sourcePath: string,
@@ -58,7 +80,6 @@ async function transcribeRange(
   depth: number,
   partLabel: string,
 ): Promise<{ text: string; audioSeconds: number }> {
-  const adapter = getSttAdapter();
   const durationSec = Math.max(0.05, endSec - startSec);
   const outPath = chunkPath(transcriptionId, idx, `-d${depth}${partLabel}`);
 
@@ -78,6 +99,7 @@ async function transcribeRange(
 
     const middle = startSec + durationSec / 2;
     const first = await transcribeRange(
+      adapter,
       transcriptionId,
       idx,
       sourcePath,
@@ -87,6 +109,7 @@ async function transcribeRange(
       `${partLabel}a`,
     );
     const second = await transcribeRange(
+      adapter,
       transcriptionId,
       idx,
       sourcePath,
@@ -110,34 +133,88 @@ async function transcribeRange(
   }
 }
 
-/** Reintentos con backoff exponencial: hasta `maxAttempts` por fragmento. */
-async function transcribeChunkWithRetries(
+interface ChunkOutcome {
+  text: string;
+  audioSeconds: number;
+  adapter: SttAdapter;
+}
+
+/**
+ * Transcribe un fragmento recorriendo la cadena de proveedores.
+ *
+ * Por cada proveedor: hasta `maxAttempts` intentos con backoff exponencial
+ * para errores transitorios. Un 429 de cuota **no consume intentos**: se salta
+ * de inmediato al siguiente proveedor de la cadena (desbordamiento). Si todos
+ * se quedan sin cuota, se lanza `SttQuotaExhausted` con la espera más corta de
+ * todas, y el llamante decide si dormir o aparcar el trabajo.
+ */
+async function transcribeChunkWithChain(
+  chain: readonly SttAdapter[],
   transcriptionId: string,
   chunk: Chunk,
   sourcePath: string,
-): Promise<{ text: string; audioSeconds: number }> {
+): Promise<ChunkOutcome> {
   const start = Number.parseFloat(chunk.startSec);
   const end = Number.parseFloat(chunk.endSec);
+
   let lastError: unknown = null;
+  let quotaWaits: number[] = [];
+  let exhaustedByQuota = 0;
 
-  for (let attempt = chunk.attempts; attempt < CHUNKING.maxAttempts; attempt += 1) {
-    await repo.updateChunk(chunk.id, { attempts: attempt + 1 });
+  for (const adapter of chain) {
+    let attempt = 0;
 
-    try {
-      return await transcribeRange(transcriptionId, chunk.idx, sourcePath, start, end, 0, '');
-    } catch (error: unknown) {
-      lastError = error;
+    while (attempt < CHUNKING.maxAttempts) {
+      await repo.updateChunk(chunk.id, { attempts: chunk.attempts + attempt + 1 });
 
-      const retryable = !(error instanceof SttError) || error.retryable;
-      const remaining = CHUNKING.maxAttempts - attempt - 1;
+      try {
+        const result = await transcribeRange(
+          adapter,
+          transcriptionId,
+          chunk.idx,
+          sourcePath,
+          start,
+          end,
+          0,
+          '',
+        );
+        return { ...result, adapter };
+      } catch (error: unknown) {
+        lastError = error;
 
-      console.warn(
-        `[worker] Fragmento ${chunk.idx + 1} falló (intento ${attempt + 1}/${CHUNKING.maxAttempts}): ${errorMessage(error)}`,
-      );
+        if (error instanceof SttError && error.kind === 'quota') {
+          // Sin cuota aquí: no gastamos más intentos con este proveedor,
+          // probamos el siguiente de la cadena inmediatamente.
+          exhaustedByQuota += 1;
+          if (error.retryAfterSec !== null) quotaWaits.push(error.retryAfterSec);
+          console.warn(
+            `[worker] ${adapter.name} sin cuota en el fragmento ${chunk.idx + 1}` +
+              (error.retryAfterSec !== null ? ` (reintentar en ${error.retryAfterSec} s)` : ''),
+          );
+          break;
+        }
 
-      if (!retryable || remaining <= 0) break;
-      await sleep(1000 * 2 ** attempt);
+        const retryable = !(error instanceof SttError) || error.retryable;
+        console.warn(
+          `[worker] Fragmento ${chunk.idx + 1} con ${adapter.name} falló ` +
+            `(intento ${attempt + 1}/${CHUNKING.maxAttempts}): ${errorMessage(error)}`,
+        );
+
+        attempt += 1;
+        if (!retryable || attempt >= CHUNKING.maxAttempts) break;
+        await sleep(backoffDelayMs(attempt - 1, 1000, QUOTA.transientBackoffCapMs));
+      }
     }
+  }
+
+  // Todos los proveedores agotados por cuota: es una espera, no un fallo.
+  if (exhaustedByQuota === chain.length) {
+    quotaWaits = quotaWaits.filter((value) => value > 0);
+    const shortest = quotaWaits.length > 0 ? Math.min(...quotaWaits) : null;
+    throw new SttQuotaExhausted(
+      `Sin cuota en ${chain.map((a) => a.name).join(' ni ')}`,
+      shortest,
+    );
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
@@ -209,7 +286,10 @@ export async function processJob(job: Transcription, stop: StopSignal): Promise<
   }
 
   // ── 4. Transcribir fragmento a fragmento ─────────────────────────────────
-  const adapter = getSttAdapter();
+  // Cadena de proveedores: el que pidió el usuario primero, el resto como
+  // desbordamiento cuando el anterior se queda sin cuota.
+  const chain = resolveSttChain(job.sttProvider);
+  console.log(`[worker] ${job.id}: cadena STT = ${chain.map((a) => a.name).join(' → ')}`);
 
   for (const chunk of allChunks) {
     if (chunk.status === 'done') continue;
@@ -218,10 +298,46 @@ export async function processJob(job: Transcription, stop: StopSignal): Promise<
     if (stop.stopped()) throw new JobInterrupted();
 
     try {
-      const { text, audioSeconds } = await transcribeChunkWithRetries(job.id, chunk, normPath);
-      await repo.updateChunk(chunk.id, { status: 'done', rawText: text, error: null });
-      await repo.addCost(job.id, sttCostUsd(audioSeconds, adapter.pricePerAudioHourUsd));
+      const outcome = await transcribeChunkWithChain(chain, job.id, chunk, normPath);
+      await repo.updateChunk(chunk.id, {
+        status: 'done',
+        rawText: outcome.text,
+        sttProvider: outcome.adapter.name,
+        error: null,
+      });
+      await repo.addCost(
+        job.id,
+        sttCostUsd(outcome.audioSeconds, outcome.adapter.pricePerAudioHourUsd),
+      );
     } catch (error: unknown) {
+      if (error instanceof SttQuotaExhausted) {
+        // No es un fallo del fragmento: es que no hay cuota en ninguna parte.
+        // Se aparca el trabajo con una marca de reanudación; el worker sigue
+        // con otros y lo retoma solo cuando la ventana se abra. El fragmento
+        // en curso queda `pending`, así que se reintenta desde donde estaba.
+        const { defer, waitSec } = decideDeferral(
+          error.retryAfterSec,
+          QUOTA.deferThresholdSec,
+          QUOTA.defaultWaitSec,
+          QUOTA.maxWaitSec,
+        );
+
+        const resumeAt = new Date(Date.now() + waitSec * 1000);
+        const doneCount = allChunks.filter((item) => item.status === 'done').length;
+
+        const reason = defer
+          ? `Cuota de transcripción agotada (${error.message}). Se reanudará solo ` +
+            `sobre las ${resumeAt.toLocaleTimeString('es-ES', {
+              hour: '2-digit',
+              minute: '2-digit',
+            })}. ${doneCount} de ${allChunks.length} fragmentos ya transcritos se conservan.`
+          : `Proveedor saturado; reintentando en ${waitSec} s. ` +
+            `${doneCount} de ${allChunks.length} fragmentos ya transcritos.`;
+
+        console.log(`[worker] ${job.id} aparcado hasta ${resumeAt.toISOString()}: ${reason}`);
+        throw new JobDeferred(resumeAt, reason);
+      }
+
       // Nunca abortamos el trabajo entero por un fragmento (§2).
       const message = errorMessage(error);
       await repo.updateChunk(chunk.id, { status: 'failed', error: message.slice(0, 2000) });
