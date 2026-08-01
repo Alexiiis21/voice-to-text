@@ -1,15 +1,17 @@
-# syntax=docker/dockerfile:1
-
 ###############################################################################
 # 1. Dependencias
 ###############################################################################
 FROM node:22-slim AS deps
 WORKDIR /app
 
+# Sin `--mount=type=cache`: es una extensión de BuildKit y el builder Metal de
+# Railway exige un `id=` explícito en las cachés, lo que obligaría a incrustar
+# el ID del servicio en el Dockerfile. Ahorraba ~40 s de build a cambio de
+# romper la portabilidad; no compensa. Ver README §6.
+#
 # `npm ci` necesita el lockfile. Si aún no existe (primer clone), cae a install.
 COPY package.json package-lock.json* ./
-RUN --mount=type=cache,target=/root/.npm \
-    if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 ###############################################################################
 # 2. Build: Next.js en modo standalone + worker y migraciones bundleados

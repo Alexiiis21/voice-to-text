@@ -371,6 +371,17 @@ como **booleanos**; jamás sus valores.
 `git push` a la rama conectada. El primer build tarda unos minutos (instala
 ffmpeg en la imagen).
 
+> **Sin cachés de BuildKit en el Dockerfile, a propósito.** El builder *Metal*
+> de Railway rechaza `RUN --mount=type=cache,target=…` con
+> `flag is missing an id argument`: namespacea las cachés por servicio y exige
+> un `id=` explícito. Añadirlo obligaría a incrustar el ID del servicio de
+> Railway en el Dockerfile, que dejaría de compilar en local y en CI. Como sólo
+> ahorraba ~40 s de `npm ci`, se ha eliminado. El Dockerfile no usa **ninguna**
+> extensión de BuildKit y compila igual con `DOCKER_BUILDKIT=0`.
+>
+> Si algún día quieres recuperar la caché sólo en Railway, la forma soportada es
+> `RUN --mount=type=cache,id=s/<service-id>-/root/.npm,target=/root/.npm`.
+
 ### 6.6 No actives serverless / scale-to-zero
 
 **No actives el modo serverless ni scale-to-zero de Railway en esta versión.**
