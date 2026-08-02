@@ -1,6 +1,7 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { env } from '@/lib/env';
+import { assertDatabaseUrl } from '@/lib/db-url';
 import * as schema from './schema';
 
 /**
@@ -14,6 +15,10 @@ const globalForDb = globalThis as unknown as {
 };
 
 function createClient(): ReturnType<typeof postgres> {
+  // Diagnóstico claro y sin credenciales antes de que postgres.js lance un
+  // `TypeError: Invalid URL` volcando la cadena de conexión entera.
+  assertDatabaseUrl(env.databaseUrl, 'db');
+
   return postgres(env.databaseUrl, {
     max: 5,
     idle_timeout: 20,

@@ -26,6 +26,7 @@ bajo demanda).
 11. [Decisiones y desviaciones respecto a la especificación](#11-decisiones-y-desviaciones-respecto-a-la-especificación)
 12. [Trabajo futuro](#12-trabajo-futuro)
 13. [Desarrollo](#13-desarrollo)
+14. [Problemas frecuentes](#14-problemas-frecuentes)
 
 ---
 
@@ -351,6 +352,20 @@ TURNSTILE_SECRET_KEY           = 0x4AAA…
 
 `DATABASE_URL` debe ser una **variable de referencia** (`${{Postgres.DATABASE_URL}}`),
 no un valor copiado: así sigue siendo válida si Railway rota las credenciales.
+
+> ⚠️ **No compongas `DATABASE_URL` a mano a partir de piezas.** Escribir
+> `postgresql://${{Postgres.PGUSER}}:${{Postgres.PGPASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}`
+> parece equivalente, pero si el nombre de alguna de esas variables no coincide
+> exactamente, Railway la sustituye por **cadena vacía** en lugar de fallar. El
+> resultado es una URL como `postgresql://postgres:clave@:/railway` —sin host ni
+> puerto— y el contenedor entra en crash-loop antes de escuchar, así que el
+> healthcheck falla sin más explicación.
+>
+> Usa **una sola referencia**: `${{Postgres.DATABASE_URL}}`. En el panel, escribe
+> `${{` en el campo del valor y elige del desplegable en vez de teclearlo.
+>
+> Si aun así falla, el arranque ahora dice exactamente qué le pasa a la URL
+> (con la contraseña oculta). Ver [Problemas frecuentes](#14-problemas-frecuentes).
 
 Para que `NEXT_PUBLIC_TURNSTILE_SITE_KEY` entre en el bundle del cliente, el
 `Dockerfile` la declara como `ARG`. En Railway basta con definirla como
@@ -706,6 +721,63 @@ completados y el borde del panel activo.
 
 Los primitivos de shadcn heredan estos colores porque las variables CSS del tema
 están reescritas en `src/app/globals.css`; no se usa el tema por defecto.
+
+---
+
+## 14. Problemas frecuentes
+
+### `Healthcheck failed! 1/1 replicas never became healthy`
+
+El healthcheck es la víctima, no la causa: el contenedor está reiniciándose antes
+de llegar a escuchar. Mira los **Deploy Logs**, no los de Build. Casi siempre es
+`DATABASE_URL`.
+
+### `DATABASE_URL no es válida … Falta el host`
+
+```
+[migrate] DATABASE_URL no es válida.
+  URL recibida (contraseña oculta): postgresql://postgres:***@:/railway
+  - Falta el host. …
+```
+
+`DATABASE_URL` se compuso a mano con referencias que no resuelven. Sustitúyela por
+la referencia completa `${{Postgres.DATABASE_URL}}`. Ver [§6.3](#63-variables-de-entorno-del-servicio-web).
+
+Los mensajes salen de `src/lib/db-url.ts`, que valida la URL **antes** de pasarla
+a postgres.js. El motivo de que exista: postgres.js respondía con un escueto
+`TypeError: Invalid URL` **y volcaba la cadena de conexión completa, con la
+contraseña, en los logs de despliegue**. La validación propia falla rápido, dice
+qué falta y redacta siempre la credencial.
+
+> Si alguna vez ves una contraseña en tus logs, **rótala**: Railway → servicio
+> Postgres → Variables → regenerar. Los logs de despliegue se conservan.
+
+### `flag '--mount=type=cache' is missing an id argument`
+
+Es el builder Metal de Railway rechazando una caché de BuildKit. El `Dockerfile`
+de este repo ya no usa ninguna extensión de BuildKit. Ver [§6.5](#65-desplegar).
+
+### El deploy sube pero un audio se queda en `queued` con "ESPERANDO CUOTA"
+
+No es un error: el proveedor STT se quedó sin cuota horaria y el trabajo se
+reanuda solo. Ver [§3.bis](#3bis-cuotas-del-proveedor-desbordamiento-y-reanudación).
+
+### `403` al subir el segundo audio seguido
+
+El token de Turnstile es de un solo uso y caduca a los 300 s. El cliente pide uno
+nuevo tras cada subida; si aun así ocurre, recarga la página. Si `TURNSTILE_SECRET_KEY`
+está definida pero `NEXT_PUBLIC_TURNSTILE_SITE_KEY` no entró en el build, el
+widget no se renderiza y no hay token: **redespliega** tras añadirla.
+
+### Las migraciones reintentan al arrancar
+
+```
+[migrate] Postgres todavía no acepta conexiones (ECONNREFUSED); reintento 1/5 en 2 s
+```
+
+Normal en el primer despliegue: el plugin de Postgres tarda en aceptar conexiones.
+Se reintenta 5 veces con backoff. Si agota los intentos, revisa que ambos servicios
+estén en el mismo proyecto de Railway.
 
 Sin emojis en la interfaz, sin ilustraciones, sin degradados morados. La carga
 se representa con barras rectangulares grises que pulsan, nunca con spinners
