@@ -1,3 +1,12 @@
+/**
+ * Rutas del scratch local.
+ *
+ * **Todo lo de aquí es efímero.** En Railway estas rutas caían en el volumen
+ * persistente; en Vercel caen en `/tmp`, que vive lo que vive la invocación.
+ * Sirven para darle a ffmpeg ficheros de verdad sobre los que trabajar —no
+ * sabe leer de una URL— y nada más. Lo que tiene que sobrevivir de una
+ * invocación a la siguiente va a Vercel Blob (ver ./blob.ts).
+ */
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { env } from './env';

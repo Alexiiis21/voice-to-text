@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { upload } from '@vercel/blob/client';
 import { toast } from 'sonner';
 import { HistoryPanel } from './history-panel';
 import { ProgressPanel } from './progress-panel';
@@ -174,6 +175,17 @@ export function Transcriber({
 
   useEffect(() => closeStream, [closeStream]);
 
+  /**
+   * Subida en dos pasos.
+   *
+   * 1. El fichero va **directo del navegador a Vercel Blob**. Antes iba en un
+   *    multipart a `/api/transcriptions`, pero el cuerpo de una petición a una
+   *    función serverless está limitado a 4,5 MB y aquí se suben cientos.
+   *    `upload()` pide primero un token a `/api/blob/upload`, que es donde
+   *    siguen verificándose Turnstile y el rate limit antes de dejar subir nada.
+   * 2. Con la URL del blob ya en la mano, se confirma contra
+   *    `/api/transcriptions`, que crea la fila y despierta al procesador.
+   */
   const submit = useCallback(
     (file: File) => {
       if (turnstileSiteKey && !turnstileToken) {
@@ -186,74 +198,78 @@ export function Transcriber({
       setDetail(null);
       closeStream();
 
-      const form = new FormData();
-      // El token va ANTES del fichero: el servidor lo verifica sin haber
-      // escrito un solo byte en disco.
-      if (turnstileToken) form.append('turnstileToken', turnstileToken);
-      form.append('sttProvider', provider);
-      form.append('file', file, file.name);
-
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/api/transcriptions');
-
-      xhr.upload.addEventListener('progress', (event) => {
-        if (event.lengthComputable) {
-          setUploadPercent(Math.round((event.loaded / event.total) * 100));
-        }
-      });
-
-      xhr.addEventListener('load', () => {
-        setUploadPercent(null);
-        // El token ya se ha gastado, con éxito o sin él: pedimos otro.
+      const consumeTurnstile = (): void => {
+        // El token es de un solo uso, con éxito o sin él: pedimos otro.
         setTurnstileToken(null);
         setTurnstileNonce((value) => value + 1);
+      };
 
-        let payload: { id?: string; transcription?: TranscriptionView; quota?: QuotaSnapshot; error?: string } = {};
+      void (async () => {
         try {
-          payload = JSON.parse(xhr.responseText) as typeof payload;
-        } catch {
-          payload = { error: 'Respuesta ilegible del servidor' };
-        }
+          const blob = await upload(file.name, file, {
+            access: 'public',
+            handleUploadUrl: '/api/blob/upload',
+            clientPayload: JSON.stringify({ turnstileToken, filename: file.name }),
+            onUploadProgress: ({ percentage }) => {
+              setUploadPercent(Math.round(percentage));
+            },
+          });
 
-        if (xhr.status !== 202 || !payload.id) {
+          consumeTurnstile();
+          setUploadPercent(null);
+
+          const response = await fetch('/api/transcriptions', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              blobUrl: blob.url,
+              filename: file.name,
+              sttProvider: provider,
+            }),
+          });
+
+          const payload = (await response.json().catch(() => ({}))) as {
+            id?: string;
+            transcription?: TranscriptionView;
+            quota?: QuotaSnapshot;
+            error?: string;
+          };
+
+          if (response.status !== 202 || !payload.id) {
+            setBusy(false);
+            toast.error('No se pudo encolar el audio', {
+              description: payload.error ?? `El servidor respondió ${response.status}`,
+            });
+            void refreshQuota();
+            return;
+          }
+
+          if (payload.quota) setQuota(payload.quota);
+          if (payload.transcription) {
+            setDetail({
+              ...payload.transcription,
+              rawText: null,
+              cleanText: null,
+              summaryText: null,
+              chunks: [],
+            });
+          }
+
+          openStream(payload.id);
+          void refreshHistory();
+          toast.success('Audio en cola', { description: file.name });
+        } catch (error: unknown) {
+          consumeTurnstile();
+          setUploadPercent(null);
           setBusy(false);
-          toast.error('No se pudo encolar el audio', {
-            description: payload.error ?? `El servidor respondió ${xhr.status}`,
+          // `upload()` levanta con el mensaje que devolvió /api/blob/upload:
+          // formato no soportado, antibot, cuota agotada. Se muestra tal cual.
+          toast.error('No se pudo subir el audio', {
+            description: error instanceof Error ? error.message : 'Error de red durante la subida',
           });
           void refreshQuota();
-          return;
         }
-
-        if (payload.quota) setQuota(payload.quota);
-        if (payload.transcription) {
-          setDetail({
-            ...payload.transcription,
-            rawText: null,
-            cleanText: null,
-            summaryText: null,
-            chunks: [],
-          });
-        }
-
-        openStream(payload.id);
-        void refreshHistory();
-        toast.success('Audio en cola', { description: file.name });
-      });
-
-      xhr.addEventListener('error', () => {
-        setUploadPercent(null);
-        setBusy(false);
-        setTurnstileToken(null);
-        setTurnstileNonce((value) => value + 1);
-        toast.error('Error de red durante la subida');
-      });
-
-      xhr.addEventListener('abort', () => {
-        setUploadPercent(null);
-        setBusy(false);
-      });
-
-      xhr.send(form);
+      })();
     },
     [
       closeStream,

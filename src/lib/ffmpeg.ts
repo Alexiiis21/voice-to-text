@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
 import { CHUNKING, NORMALIZE_ARGS } from './config';
+import { ffmpegPath } from './ffmpeg-bin';
+import { parseProbeOutput, parseProgressDuration } from './probe-parse';
 import { parseSilenceLog, type SilenceInterval } from './silence';
 
 export class FfmpegError extends Error {
@@ -56,13 +58,13 @@ function run(bin: string, args: readonly string[], maxStderrBytes = 4 * 1024 * 1
   });
 }
 
-/** Comprueba que ffmpeg y ffprobe están en el PATH. Usado por /api/health. */
-export async function ffmpegAvailable(): Promise<{ ffmpeg: boolean; ffprobe: boolean }> {
-  const [ffmpeg, ffprobe] = await Promise.all([
-    run('ffmpeg', ['-version']).then((r) => r.code === 0).catch(() => false),
-    run('ffprobe', ['-version']).then((r) => r.code === 0).catch(() => false),
-  ]);
-  return { ffmpeg, ffprobe };
+/** Comprueba que el binario de ffmpeg se puede ejecutar. Usado por /api/health. */
+export async function ffmpegAvailable(): Promise<{ ffmpeg: boolean; path: string }> {
+  const path = ffmpegPath();
+  const ffmpeg = await run(path, ['-version'])
+    .then((r) => r.code === 0)
+    .catch(() => false);
+  return { ffmpeg, path };
 }
 
 export interface ProbeResult {
@@ -72,65 +74,54 @@ export interface ProbeResult {
   channels: number | null;
 }
 
-interface FfprobeStream {
-  codec_type?: string;
-  codec_name?: string;
-  sample_rate?: string;
-  channels?: number;
-  duration?: string;
-}
-
-interface FfprobeFormat {
-  duration?: string;
-}
-
-interface FfprobeOutput {
-  streams?: FfprobeStream[];
-  format?: FfprobeFormat;
-}
-
 /**
- * Valida el archivo con ffprobe. Si no reconoce un stream de audio, lanza:
+ * Valida el archivo y devuelve sus metadatos. Si no hay stream de audio, lanza:
  * esto es lo que protege de archivos maliciosos disfrazados de audio (§5).
+ *
+ * Antes esto era `ffprobe -print_format json`. Ahora se lee la cabecera que
+ * ffmpeg imprime en stderr, porque empaquetar un segundo binario de ~78 MB no
+ * cabe en el límite de 250 MB de una función de Vercel (ver ./ffmpeg-bin.ts).
+ *
+ * `ffmpeg -i fichero` sin fichero de salida termina con código 1 y el mensaje
+ * "At least one output file must be specified" **después** de haber volcado la
+ * cabecera. Ese código de salida es esperado y se ignora a propósito: lo que
+ * decide si el archivo vale es que aparezca un stream de audio, no el código.
  */
 export async function probeAudio(filePath: string): Promise<ProbeResult> {
-  const { stdout, stderr, code } = await run('ffprobe', [
-    '-v',
-    'error',
-    '-print_format',
-    'json',
-    '-show_format',
-    '-show_streams',
-    filePath,
-  ]);
+  const { stderr, code } = await run(ffmpegPath(), ['-hide_banner', '-i', filePath]);
 
-  if (code !== 0) {
-    throw new FfmpegError('ffprobe no pudo leer el archivo', stderr, code);
-  }
-
-  let parsed: FfprobeOutput;
-  try {
-    parsed = JSON.parse(stdout) as FfprobeOutput;
-  } catch {
-    throw new FfmpegError('ffprobe devolvió una salida ilegible', stderr, code);
-  }
-
-  const audio = (parsed.streams ?? []).find((s) => s.codec_type === 'audio');
-  if (!audio) {
+  const parsed = parseProbeOutput(stderr);
+  if (!parsed) {
     throw new FfmpegError('El archivo no contiene ningún stream de audio', stderr, code);
   }
 
-  const rawDuration = audio.duration ?? parsed.format?.duration;
-  const durationSec = rawDuration === undefined ? Number.NaN : Number.parseFloat(rawDuration);
-  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+  let durationSec = parsed.durationSec;
+
+  // Algunos contenedores (notas de voz de WhatsApp truncadas, sobre todo) no
+  // traen duración en la cabecera. Sale decodificando entero a /dev/null: es
+  // caro, pero sólo ocurre en esos casos y sin duración no se puede trocear.
+  if (durationSec === null) {
+    const decoded = await run(ffmpegPath(), [
+      '-nostdin',
+      '-hide_banner',
+      '-i',
+      filePath,
+      '-f',
+      'null',
+      '-',
+    ]);
+    durationSec = parseProgressDuration(decoded.stderr);
+  }
+
+  if (durationSec === null || !Number.isFinite(durationSec) || durationSec <= 0) {
     throw new FfmpegError('No se pudo determinar la duración del audio', stderr, code);
   }
 
   return {
     durationSec,
-    codec: audio.codec_name ?? 'desconocido',
-    sampleRate: audio.sample_rate ? Number.parseInt(audio.sample_rate, 10) : null,
-    channels: audio.channels ?? null,
+    codec: parsed.codec,
+    sampleRate: parsed.sampleRate,
+    channels: parsed.channels,
   };
 }
 
@@ -139,7 +130,7 @@ export async function probeAudio(filePath: string): Promise<ProbeResult> {
  * mono, así que no se pierde calidad de reconocimiento y el peso baja ~25×.
  */
 export async function normalizeAudio(inputPath: string, outputPath: string): Promise<void> {
-  const { stderr, code } = await run('ffmpeg', [
+  const { stderr, code } = await run(ffmpegPath(), [
     '-nostdin',
     '-hide_banner',
     '-loglevel',
@@ -162,7 +153,7 @@ export async function normalizeAudio(inputPath: string, outputPath: string): Pro
 /** Primera pasada: detección de silencios sobre el audio ya normalizado. */
 export async function detectSilences(filePath: string): Promise<SilenceInterval[]> {
   const filter = `silencedetect=noise=${CHUNKING.silenceNoiseDb}dB:d=${CHUNKING.silenceMinDurSec}`;
-  const { stderr, code } = await run('ffmpeg', [
+  const { stderr, code } = await run(ffmpegPath(), [
     '-nostdin',
     '-hide_banner',
     '-i',
@@ -194,7 +185,7 @@ export async function extractChunk(
   startSec: number,
   durationSec: number,
 ): Promise<void> {
-  const { stderr, code } = await run('ffmpeg', [
+  const { stderr, code } = await run(ffmpegPath(), [
     '-nostdin',
     '-hide_banner',
     '-loglevel',

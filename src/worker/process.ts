@@ -10,6 +10,7 @@ import {
   uploadPath,
 } from '@/lib/files';
 import { detectSilences, extractChunk, normalizeAudio, probeAudio } from '@/lib/ffmpeg';
+import { deleteBlobs, downloadToFile, normalizedKey, uploadFile } from '@/lib/blob';
 import { computeCutPoints } from '@/lib/silence';
 import { joinChunkTexts } from '@/lib/overlap';
 import {
@@ -21,7 +22,9 @@ import {
   type SttAdapter,
 } from '@/lib/stt';
 import { sttCostUsd } from '@/lib/cost';
+import { commitAudioSeconds } from '@/lib/rate-limit';
 import { anthropicConfigured, cleanupChunk } from '@/lib/claude';
+import { safeErrorMessage } from '@/lib/redact';
 import type { Chunk, Transcription } from '@/db/schema';
 import * as repo from './repo';
 
@@ -59,8 +62,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Mensaje de error seguro para logs y para la columna `error`.
+ *
+ * Pasa siempre por `redactSecrets`: los SDK de terceros meten credenciales en
+ * el texto de sus excepciones (el de Anthropic incluye la clave entera en
+ * `Headers.append: "…" is an invalid header value`).
+ */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return safeErrorMessage(error);
 }
 
 /**
@@ -240,6 +250,23 @@ async function mapWithConcurrency<T>(
 }
 
 /**
+ * Borra el audio de una transcripción: el scratch local y los blobs.
+ *
+ * Es el cumplimiento de §6 ("el audio se borra siempre al terminar, con éxito o
+ * sin él"). Las URLs se ponen a NULL en la misma operación para que no quede
+ * una referencia a un blob que ya no existe.
+ */
+export async function discardAudio(
+  id: string,
+  sourceExt: string | null,
+  urls: readonly (string | null)[],
+): Promise<void> {
+  await removeTranscriptionFiles(id, sourceExt);
+  await deleteBlobs(urls);
+  await repo.setBlobUrls(id, { sourceUrl: null, normalizedUrl: null });
+}
+
+/**
  * Procesa un trabajo de principio a fin. Lanza `JobInterrupted` si llega
  * SIGTERM entre fragmentos; el llamante lo devuelve a `queued`.
  */
@@ -247,19 +274,62 @@ export async function processJob(job: Transcription, stop: StopSignal): Promise<
   const originalPath = uploadPath(job.id, job.sourceExt);
   const normPath = normalizedPath(job.id);
 
-  // ── 1. Normalizar ────────────────────────────────────────────────────────
+  // ── 1. Tener el audio normalizado en local ───────────────────────────────
+  //
+  // Tres caminos, del más barato al más caro:
+  //   a) ya está en /tmp de una invocación anterior que reusó la instancia;
+  //   b) está en Blob porque otra invocación ya lo normalizó: se descarga;
+  //   c) no existe: se baja el original, se normaliza y se sube el resultado.
+  //
+  // El (c) sólo pasa una vez por trabajo. Normalizar tres horas de audio son
+  // un par de minutos, así que subir el mp3 resultante a Blob es lo que hace
+  // que un trabajo largo se pueda reanudar sin repetir ese trabajo.
+  let normalizedUrl = job.normalizedUrl;
+
   if (!(await fileExists(normPath))) {
-    if (!(await fileExists(originalPath))) {
-      throw new Error('El archivo de audio ya no está en disco');
+    if (normalizedUrl !== null) {
+      console.log(`[worker] Recuperando el normalizado de ${job.id} desde Blob`);
+      await downloadToFile(normalizedUrl, normPath);
+    } else {
+      if (job.sourceUrl === null) {
+        throw new Error('El audio original ya no está disponible');
+      }
+
+      console.log(`[worker] Descargando el original de ${job.id}`);
+      await downloadToFile(job.sourceUrl, originalPath);
+
+      console.log(`[worker] Normalizando ${job.id}`);
+      await normalizeAudio(originalPath, normPath);
+
+      normalizedUrl = await uploadFile(normalizedKey(job.id), normPath, 'audio/mpeg');
+      await repo.setBlobUrls(job.id, { normalizedUrl });
+
+      // El original ya no hace falta: todo lo que viene después trabaja sobre
+      // el normalizado. Borrarlo ya libera el grueso del almacenamiento (el
+      // original puede pesar 25× más) y adelanta la promesa de §6.
+      await deleteBlobs([job.sourceUrl]);
+      await repo.setBlobUrls(job.id, { sourceUrl: null });
+      await removeQuietly(originalPath);
     }
-    console.log(`[worker] Normalizando ${job.id}`);
-    await normalizeAudio(originalPath, normPath);
   }
 
   // ── 2. Duración ──────────────────────────────────────────────────────────
+  //
+  // Éste es además el punto donde se valida que el fichero es audio de verdad:
+  // `probeAudio` lanza si no encuentra ningún stream de audio. En el despliegue
+  // en contenedor esa comprobación estaba en la subida, pero con la subida
+  // directa a Blob la ruta de encolado no tiene el fichero (§5 se mantiene, el
+  // rechazo sólo llega más tarde y en forma de trabajo fallido).
   const probe = await probeAudio(normPath);
   if (job.durationSec === null) {
     await repo.setDuration(job.id, probe.durationSec);
+  }
+
+  // El límite de segundos de audio por IP se salda aquí, que es cuando se
+  // conoce la duración real, y la IP se olvida acto seguido.
+  if (job.clientIp !== null) {
+    await commitAudioSeconds(job.clientIp, probe.durationSec);
+    await repo.clearClientIp(job.id);
   }
 
   // ── 3. Puntos de corte ───────────────────────────────────────────────────
@@ -361,7 +431,7 @@ export async function processJob(job: Transcription, stop: StopSignal): Promise<
 
   const anyDone = allChunks.some((chunk) => chunk.status === 'done');
   if (!anyDone) {
-    await removeTranscriptionFiles(job.id, job.sourceExt);
+    await discardAudio(job.id, job.sourceExt, [job.sourceUrl, normalizedUrl]);
     throw new Error('Ningún fragmento se pudo transcribir');
   }
 
@@ -406,8 +476,8 @@ export async function processJob(job: Transcription, stop: StopSignal): Promise<
     await repo.setTexts(job.id, { cleanText, wordCount: countWords(cleanText) });
   }
 
-  // ── 7. Borrar el audio del disco y cerrar ────────────────────────────────
-  await removeTranscriptionFiles(job.id, job.sourceExt);
+  // ── 7. Borrar el audio y cerrar ──────────────────────────────────────────
+  await discardAudio(job.id, job.sourceExt, [job.sourceUrl, normalizedUrl]);
 
   const failedCount = allChunks.filter((chunk) => chunk.status === 'failed').length;
   await repo.setStatus(job.id, 'done', {

@@ -3,9 +3,32 @@ import { db } from '@/db';
 import { chunks, transcriptions } from '@/db/schema';
 import { SSE_POLL_MS } from '@/lib/config';
 import { toChunkView, toView } from '@/lib/serialize';
+import { triggerProcessing } from '@/lib/trigger';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const maxDuration = 300;
+
+/**
+ * La conexión se cierra por nuestra cuenta antes de que Vercel mate la función.
+ *
+ * En Railway esta conexión podía durar las tres horas del trabajo. Aquí hay un
+ * `maxDuration`, así que se corta con margen y se deja que `EventSource`
+ * reconecte solo: el cliente recibe otra vez `status_change` con el estado
+ * completo, así que la reconexión no pierde nada.
+ */
+const STREAM_BUDGET_MS = 270_000;
+
+/**
+ * Cada cuánto, como mucho, puede este stream despertar al procesador.
+ *
+ * El SSE hace de planificador de repuesto: si el usuario tiene la pestaña
+ * abierta esperando y su trabajo está en `queued` —porque el disparo de la
+ * subida se perdió, o porque estaba aparcado por cuota y su ventana ya se ha
+ * abierto—, esta ruta lo relanza. Es lo que hace usable el plan Hobby, donde el
+ * cron sólo corre una vez al día.
+ */
+const WAKE_INTERVAL_MS = 30_000;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -76,7 +99,17 @@ export async function GET(request: Request, { params }: Params): Promise<Respons
       // Comentario inicial: fuerza el flush de proxies intermedios.
       send('open', { id });
 
+      const deadline = Date.now() + STREAM_BUDGET_MS;
+      let lastWakeAt = 0;
+
       while (!closed && !request.signal.aborted) {
+        if (Date.now() >= deadline) {
+          // Fin del presupuesto de la función. No es un error ni un final: se
+          // cierra y EventSource vuelve a conectar.
+          close();
+          break;
+        }
+
         try {
           const [row] = await db
             .select()
@@ -113,6 +146,17 @@ export async function GET(request: Request, { params }: Params): Promise<Respons
               transcription: toView(row),
               chunks: chunkRows.map(toChunkView),
             });
+          }
+
+          // Despertador de repuesto: el trabajo está esperando y nadie lo está
+          // procesando. Ver WAKE_INTERVAL_MS.
+          const waiting =
+            row.status === 'queued' &&
+            (row.resumeAfter === null || row.resumeAfter.getTime() <= Date.now());
+
+          if (waiting && Date.now() - lastWakeAt >= WAKE_INTERVAL_MS) {
+            lastWakeAt = Date.now();
+            void triggerProcessing();
           }
 
           if (TERMINAL_STATUSES.has(row.status)) {

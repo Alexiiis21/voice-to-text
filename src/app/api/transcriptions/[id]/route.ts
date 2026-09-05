@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { asc, eq } from 'drizzle-orm';
 import { db } from '@/db';
 import { chunks, transcriptions } from '@/db/schema';
+import { deleteBlobs } from '@/lib/blob';
 import { removeTranscriptionFiles } from '@/lib/files';
 import { readSessionId } from '@/lib/session';
 import { toDetail } from '@/lib/serialize';
@@ -59,7 +60,12 @@ export async function DELETE(_request: Request, { params }: Params): Promise<Nex
     );
   }
 
+  // El scratch local casi nunca tendrá nada (es de otra invocación), pero los
+  // blobs sí siguen vivos si se borra una transcripción a medio procesar. Sin
+  // esto quedarían huérfanos: nadie volvería a mirar esa fila, porque se borra
+  // justo después.
   await removeTranscriptionFiles(row.id, row.sourceExt);
+  await deleteBlobs([row.sourceUrl, row.normalizedUrl]);
   await db.delete(transcriptions).where(eq(transcriptions.id, id));
 
   return NextResponse.json({ ok: true });

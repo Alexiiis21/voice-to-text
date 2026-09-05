@@ -27,5 +27,17 @@ export function middleware(request: NextRequest): NextResponse {
 }
 
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+  /**
+   * **`/api/` queda fuera a propósito.**
+   *
+   * Originalmente era por un límite: Next.js trunca a 10 MB el cuerpo de toda
+   * petición que atraviese el middleware, y `POST /api/transcriptions` recibía
+   * el audio entero en multipart. Eso ya no aplica —el audio va directo del
+   * navegador a Blob y por las rutas sólo pasa JSON pequeño—, pero la exclusión
+   * se mantiene porque sigue siendo lo correcto por otro motivo: este
+   * middleware sólo existe para crear la cookie `session_id`, que ya se genera
+   * al cargar la página. Las rutas de API se limitan a leerla, así que
+   * ejecutarlo en cada una sería latencia por nada.
+   */
+  matcher: ['/((?!api/|_next/static|_next/image|favicon.ico).*)'],
 };

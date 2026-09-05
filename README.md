@@ -18,7 +18,7 @@ bajo demanda).
    · [Cuotas: desbordamiento y reanudación](#3bis-cuotas-del-proveedor-desbordamiento-y-reanudación)
 4. [El troceado, en detalle](#4-el-troceado-en-detalle)
 5. [Cómo obtener cada API key](#5-cómo-obtener-cada-api-key)
-6. [Despliegue en Railway, paso a paso](#6-despliegue-en-railway-paso-a-paso)
+6. [Despliegue en Vercel, paso a paso](#6-despliegue-en-vercel-paso-a-paso)
 7. [Costes por hora de audio](#7-costes-por-hora-de-audio)
 8. [Historial sin autenticación: qué implica](#8-historial-sin-autenticación-qué-implica)
 9. [Variables de entorno](#9-variables-de-entorno)
@@ -308,32 +308,50 @@ lo dicen explícitamente.
 
 ---
 
-## 6. Despliegue en Railway, paso a paso
+## 6. Despliegue en Vercel, paso a paso
 
-### 6.1 Crear el proyecto y la base de datos
+> El despliegue original era un contenedor en Railway: dos procesos vivos y un
+> volumen. El `Dockerfile` y `railway.json` siguen en el repo y siguen
+> funcionando, pero el camino soportado es Vercel. Lo que cambia y por qué está
+> en [§6.6](#66-qué-cambia-respecto-al-contenedor).
 
-1. <https://railway.app> → **New Project** → **Deploy from GitHub repo**, y
-   selecciona este repositorio. Railway detecta el `Dockerfile` (también hay un
-   `railway.json` que lo fuerza explícitamente).
-2. En el mismo proyecto: **+ New** → **Database** → **Add PostgreSQL**.
+### 6.1 Base de datos
 
-### 6.2 Volumen para el audio
+Postgres gestionado, desde **Storage** en el panel de Vercel (Neon) o desde
+<https://neon.tech> directamente. Copia la cadena de conexión.
 
-1. Selecciona el servicio `web` → pestaña **Settings** → **Volumes** →
-   **Add Volume**.
-2. **Mount path**: `/data`.
+> ⚠️ **Quita `channel_binding=require` de la cadena que copies.** Neon la incluye
+> por defecto. `postgres.js` manda al servidor todo parámetro de la URL que no
+> reconoce, y `channel_binding` no es un parámetro de servidor: Postgres cierra
+> la conexión con `unrecognized configuration parameter "channel_binding"`.
+> Deja `sslmode=require`, que sí lo entiende.
+>
+> Usa además la URL **directa**, no la del pooler (la que *no* lleva `-pooler`
+> en el host): el techo de conexiones de esta app es bajo y las migraciones van
+> más tranquilas sin PgBouncer por medio.
 
-El worker crea `/data/uploads` y `/data/chunks` al arrancar. Dimensiona el
-volumen para el pico de audio simultáneo: un original de 500 MB + su normalizado
-(~10 MB) por trabajo en curso. Con 1 GB vas sobrado.
+### 6.2 Almacenamiento del audio
 
-### 6.3 Variables de entorno del servicio `web`
+**Storage** → **Create** → **Blob**, y conéctalo al proyecto. Vercel inyecta
+`BLOB_READ_WRITE_TOKEN` solo.
 
-En **Variables**, añade:
+No hay volumen que dimensionar: el audio se borra en cuanto termina la
+transcripción, así que el almacén sólo aguanta lo que haya en vuelo.
+
+> **Nota de privacidad:** Vercel Blob sólo ofrece `access: 'public'`. Las URLs
+> llevan un sufijo aleatorio y son inadivinable, pero mientras el audio existe,
+> cualquiera con la URL puede descargarlo. Es una ventana de minutos y sólo para
+> quien ya tenga el enlace, pero es una diferencia real respecto al volumen de
+> Railway, que no era accesible desde fuera.
+
+### 6.3 Variables de entorno
+
+En **Settings** → **Environment Variables** (ver [`.env.example`](.env.example)
+para la lista completa y comentada):
 
 ```
-DATABASE_URL       = ${{Postgres.DATABASE_URL}}   ← variable de referencia
-DATA_DIR           = /data
+DATABASE_URL       = postgresql://…@ep-….neon.tech/neondb?sslmode=require
+PROCESS_SECRET     = <openssl rand -hex 32>
 
 STT_PROVIDER       = groq
 GROQ_API_KEY       = gsk_…
@@ -350,88 +368,80 @@ NEXT_PUBLIC_TURNSTILE_SITE_KEY = 0x4AAA…
 TURNSTILE_SECRET_KEY           = 0x4AAA…
 ```
 
-`DATABASE_URL` debe ser una **variable de referencia** (`${{Postgres.DATABASE_URL}}`),
-no un valor copiado: así sigue siendo válida si Railway rota las credenciales.
+`BLOB_READ_WRITE_TOKEN` y `CRON_SECRET` los pone Vercel; `DATA_DIR` se deja sin
+definir (por defecto usa el tmp del sistema, que es lo único escribible).
 
-> ⚠️ **No compongas `DATABASE_URL` a mano a partir de piezas.** Escribir
-> `postgresql://${{Postgres.PGUSER}}:${{Postgres.PGPASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}`
-> parece equivalente, pero si el nombre de alguna de esas variables no coincide
-> exactamente, Railway la sustituye por **cadena vacía** en lugar de fallar. El
-> resultado es una URL como `postgresql://postgres:clave@:/railway` —sin host ni
-> puerto— y el contenedor entra en crash-loop antes de escuchar, así que el
-> healthcheck falla sin más explicación.
->
-> Usa **una sola referencia**: `${{Postgres.DATABASE_URL}}`. En el panel, escribe
-> `${{` en el campo del valor y elige del desplegable en vez de teclearlo.
->
-> Si aun así falla, el arranque ahora dice exactamente qué le pasa a la URL
-> (con la contraseña oculta). Ver [Problemas frecuentes](#14-problemas-frecuentes).
+**`PROCESS_SECRET` no es opcional en producción.** Sin él ni `CRON_SECRET`,
+`/api/process` queda abierta y cualquiera puede disparar la cola y quemar tu
+cuota de Groq. `/api/health` avisa con `processProtected: false`.
 
-Para que `NEXT_PUBLIC_TURNSTILE_SITE_KEY` entre en el bundle del cliente, el
-`Dockerfile` la declara como `ARG`. En Railway basta con definirla como
-variable de servicio: Railway pasa las variables al build de Docker.
+### 6.4 Migraciones
 
-### 6.4 Healthcheck
+**Este es el paso que Vercel no hace por ti.** En el contenedor, las migraciones
+corrían al arrancar (`scripts/start.mjs`). Vercel no ejecuta ese script: sólo
+empaqueta las rutas. Así que se aplican a mano, una vez, y luego sólo cuando
+cambie el esquema:
 
-**Settings** → **Deploy** → **Health Check Path**: `/api/health`.
-Timeout recomendado: 120 s (las migraciones corren antes de que el servidor
-escuche).
-
-`/api/health` devuelve 200 sólo si hay conexión a Postgres y `ffmpeg` y
-`ffprobe` están en el PATH. Incluye qué variables de entorno están definidas
-como **booleanos**; jamás sus valores.
+```bash
+DATABASE_URL="postgresql://…?sslmode=require" npm run db:migrate
+```
 
 ### 6.5 Desplegar
 
-`git push` a la rama conectada. El primer build tarda unos minutos (instala
-ffmpeg en la imagen).
+`git push` a la rama conectada. Comprueba `/api/health`:
 
-> **Sin cachés de BuildKit en el Dockerfile, a propósito.** El builder *Metal*
-> de Railway rechaza `RUN --mount=type=cache,target=…` con
-> `flag is missing an id argument`: namespacea las cachés por servicio y exige
-> un `id=` explícito. Añadirlo obligaría a incrustar el ID del servicio de
-> Railway en el Dockerfile, que dejaría de compilar en local y en CI. Como sólo
-> ahorraba ~40 s de `npm ci`, se ha eliminado. El Dockerfile no usa **ninguna**
-> extensión de BuildKit y compila igual con `DOCKER_BUILDKIT=0`.
->
-> Si algún día quieres recuperar la caché sólo en Railway, la forma soportada es
-> `RUN --mount=type=cache,id=s/<service-id>-/root/.npm,target=/root/.npm`.
+```json
+{ "status": "ok", "database": true, "blob": true, "processProtected": true }
+```
 
-### 6.6 No actives serverless / scale-to-zero
+`ffmpeg: false` **es lo esperado ahí**: el binario sólo viaja en el bundle de
+las rutas que lo ejecutan (ver `outputFileTracingIncludes` en
+`next.config.ts`), y `/api/health` no es una de ellas.
 
-**No actives el modo serverless ni scale-to-zero de Railway en esta versión.**
-Si el contenedor duerme, el bucle del worker se detiene y un trabajo encolado
-puede quedarse esperando a la siguiente visita. La lógica de rescate al arrancar
-lo recupera, pero con retraso: un audio subido a las 3 de la mañana no empezaría
-a procesarse hasta que alguien abriera la página.
+### 6.6 Qué cambia respecto al contenedor
 
-Es una optimización válida más adelante, una vez medido el consumo real, y
-exige mover el procesado a un disparo explícito (webhook o cron) en lugar de un
-bucle continuo.
+| | Railway | Vercel |
+|---|---|---|
+| Ficheros | volumen `/data` | Vercel Blob + `/tmp` como scratch |
+| Subida | multipart a la ruta | del navegador directo a Blob |
+| Procesado | bucle infinito | `/api/process`, a plazos |
+| ffmpeg | `apt-get` en la imagen | `@ffmpeg-installer`, en el bundle |
+| Migraciones | al arrancar | `npm run db:migrate` a mano |
 
-### Presupuesto en el plan Hobby ($5/mes)
+Las tres consecuencias que conviene tener presentes:
 
-Railway factura memoria y CPU durante todo el tiempo que el contenedor está
-vivo, no por petición. Lo que hace este proyecto para caber:
+1. **El procesado va a plazos.** Una función tiene `maxDuration` (300 s), y un
+   audio de tres horas no cabe. `processJob` levanta `JobInterrupted` entre
+   fragmentos cuando se agota el presupuesto —el mismo mecanismo que usaba
+   SIGTERM—, el trabajo vuelve a `queued` con lo transcrito guardado, y la
+   invocación encadena la siguiente antes de responder. O sea: la señal
+   cooperativa de apagado que ya existía es exactamente lo que hacía falta,
+   sólo que disparada por un reloj en vez de por una señal del sistema.
 
-- Next.js en modo `standalone` e imagen base `node:22-slim`. La capa final no
-  lleva un `node_modules` completo: sólo el output trazado de Next más dos
-  bundles de esbuild (`dist/worker.js`, `dist/migrate.js`).
-- `NODE_OPTIONS=--max-old-space-size=384` en el contenedor.
-- El bucle del worker **sondea la cola cada 5 segundos** cuando está vacía;
-  cuando hay trabajo en curso itera sin esperar.
-- El barrido de retención se ejecuta **una vez al día**, comparando contra una
-  marca de tiempo persistida en `worker_state`, no colgado de un `setInterval`
-  que se reinicie con cada deploy.
-- La columna `cost_usd` registra el coste estimado de cada transcripción
-  (segundos de audio × tarifa STT + tokens × tarifa de Claude) y se muestra en
-  el historial.
+2. **Nadie sondea la cola.** Sin proceso vivo hay que despertar el procesado:
+   lo hace la confirmación de la subida, lo hace el SSE mientras el usuario
+   espera con la pestaña abierta, y como última red lo hace el cron.
 
-**Consumo medido en reposo** (`docker stats`, contenedores recién arrancados,
-sin trabajos en cola): `web` **76 MiB** y `postgres` **67 MiB**, con la CPU a
-0 %. La imagen final pesa ~850 MB, de los que la mayor parte es ffmpeg y sus
-dependencias; eso afecta al almacenamiento de build, no a la memoria en
-ejecución.
+3. **El cron del plan Hobby corre una vez al día.** Suficiente para la limpieza
+   (rescatar trabajos atascados, barrido de retención), pero inservible como
+   planificador. Por eso el camino normal es el disparo directo. Con plan Pro se
+   puede bajar `schedule` en `vercel.json` a `*/5 * * * *` y el cron pasa a ser
+   también un planificador decente.
+
+### Coste
+
+Vercel no factura por tiempo vivo sino por invocación, así que la app en reposo
+no cuesta nada — al revés que el contenedor, que se pagaba las 24 h. Lo que sí
+hay que vigilar:
+
+- **Duración de función.** Transcribir es esperar a un proveedor externo, no
+  quemar CPU, pero se factura igual. Un audio largo son varias invocaciones de
+  hasta 300 s.
+- **Blob.** Sólo el audio en vuelo, y se borra al terminar.
+- **Neon.** Aquí sí se ahorra respecto a Railway: sin worker sondeando cada 5 s,
+  la base se suspende sola cuando no hay trabajo.
+- La columna `cost_usd` sigue registrando el coste de STT + Claude por
+  transcripción, que es el grueso de la factura real.
 
 ---
 
@@ -520,25 +530,46 @@ Todas las rutas corren en `runtime = 'nodejs'`.
 | `POST /api/transcriptions/:id/summary` | Genera el resumen si no existe; devuelve el cacheado si ya está |
 | `GET /api/transcriptions` | Historial de la sesión (cookie `session_id`), últimas 20 |
 | `DELETE /api/transcriptions/:id` | Borra registro y ficheros asociados |
-| `GET /api/health` | Postgres + ffmpeg/ffprobe + presencia de variables (booleanos) |
+| `GET /api/health` | Postgres + Blob + presencia de variables (booleanos) |
 | `GET /api/quota` | Cuota restante de la IP en la ventana horaria actual |
+| `POST /api/blob/upload` | Emite el token de subida directa a Blob (Turnstile + rate limit) |
+| `POST /api/process` | Procesa la cola. Protegida por `PROCESS_SECRET`/`CRON_SECRET` |
+| `GET /api/cron` | Rescate de trabajos atascados y retención. Invocada por Vercel Cron |
 
-### Seguridad en `POST /api/transcriptions`
+### La subida, en dos pasos
+
+El audio **no pasa por ninguna función**. El cuerpo de una petición a una
+función serverless está limitado a 4,5 MB y aquí se suben cientos:
+
+1. `POST /api/blob/upload` emite un token de subida. Aquí es donde se hacen
+   todas las comprobaciones, **antes de que se escriba un solo byte**.
+2. El navegador sube el fichero directo a Vercel Blob con ese token.
+3. `POST /api/transcriptions` recibe sólo la URL resultante, comprueba que es
+   nuestra y encola.
+
+### Seguridad
 
 - **Turnstile**: verificado contra
-  `https://challenges.cloudflare.com/turnstile/v0/siteverify`. Fallo → `403`.
-  Se comprueba **antes de escribir un solo byte**: el cliente envía el campo
-  `turnstileToken` antes del fichero en el `multipart`, y el parser mantiene el
-  stream en pausa hasta que la verificación termina.
+  `https://challenges.cloudflare.com/turnstile/v0/siteverify` al emitir el
+  token. Sin token no hay subida posible.
 - **Rate limit por IP** (`x-forwarded-for`), contra la tabla `rate_limits`:
-  10 transcripciones y 6 horas de audio por hora. Exceso → `429` con cabecera
-  `Retry-After`. La reserva es un `INSERT … ON CONFLICT DO UPDATE … WHERE`
-  atómico: dos peticiones simultáneas de la misma IP no pueden colarse.
+  10 transcripciones y 2 horas de audio por hora. La reserva es un
+  `INSERT … ON CONFLICT DO UPDATE … WHERE` atómico: dos peticiones simultáneas
+  de la misma IP no pueden colarse. El contador de transcripciones se reserva al
+  emitir el token; los **segundos de audio** se contabilizan al procesar, que es
+  cuando se conoce la duración real (ver la columna `client_ip` del esquema).
 - **Allowlist de extensiones y MIME**:
   `.ogg .opus .mp3 .m4a .wav .webm .aac .flac`. Lo demás → `400`.
-- **Validación con ffprobe antes de encolar**: si ffprobe no reconoce un stream
-  de audio, `400` con mensaje claro. Esto también protege de archivos maliciosos
-  disfrazados de audio.
+- **Tamaño máximo**: lo impone Blob al emitir el token (`maximumSizeInBytes`),
+  no el cliente.
+- **La URL del blob es entrada no confiable.** Se valida el host y después se
+  confirma con un `head()` firmado con nuestro token: sin eso, la ruta de
+  encolado sería un SSRF.
+- **Validación de que es audio de verdad**: `probeAudio` lanza si ffmpeg no
+  encuentra ningún stream de audio. A diferencia del despliegue en contenedor,
+  esta comprobación ocurre **al procesar**, no al encolar: la ruta de encolado
+  ya no tiene el fichero. Un fichero disfrazado se rechaza igual, pero en forma
+  de transcripción `failed` con el motivo, no de `400` inmediato.
 - **Nombres de archivo generados por el servidor**: uuid + extensión validada.
   El nombre que envía el cliente **nunca** se usa para construir una ruta.
 
@@ -593,11 +624,17 @@ y seguir adelante dejándolo anotado. Esto es lo que hay:
    subirlo al proveedor STT, no como `Buffer`. Es lo más cerca del "no cargues
    archivos completos en memoria" que permite `fetch` con `FormData`.
 
-7. **`next build` necesita `DATABASE_URL` definida** (cualquier valor). Next
-   importa los módulos de las rutas para recolectar metadatos aunque todas sean
+7. **El build ignora `DATABASE_URL`, esté ausente o mal formada.** Next importa
+   los módulos de las rutas para recolectar metadatos aunque todas sean
    `force-dynamic`. `src/lib/env.ts` detecta la fase de build
    (`NEXT_PHASE === 'phase-production-build'`) y usa un placeholder que nunca
    llega a abrir una conexión.
+
+   Se ignora también cuando es **inválida**, no sólo cuando falta: Railway
+   inyecta las variables del servicio en el build, así que una URL rota tumbaría
+   la compilación además del arranque, y el mensaje llegaría en los Build Logs,
+   donde despista más. El build no consulta la base de datos; la validación vive
+   en `src/db/index.ts` y `src/db/migrate.ts`, ya en ejecución.
 
 8. **El rate limit por IP baja de 6 h a 2 h de audio por hora.** §5 pedía 6 h,
    pero el tier gratuito de Groq admite 7.200 s (2 h) de audio por hora **en
@@ -761,6 +798,43 @@ de este repo ya no usa ninguna extensión de BuildKit. Ver [§6.5](#65-desplegar
 
 No es un error: el proveedor STT se quedó sin cuota horaria y el trabajo se
 reanuda solo. Ver [§3.bis](#3bis-cuotas-del-proveedor-desbordamiento-y-reanudación).
+
+### `Request body exceeded 10MB` / `Unexpected end of form` al subir
+
+Next.js limita a **10 MB** el cuerpo de toda petición que atraviese el
+`middleware`. Si el matcher de `src/middleware.ts` captura `/api/transcriptions`,
+cualquier audio mayor se trunca a 10 MB y el parser multipart muere con
+`Unexpected end of form`.
+
+Por eso el matcher **excluye `/api/`**:
+
+```ts
+matcher: ['/((?!api/|_next/static|_next/image|favicon.ico).*)']
+```
+
+No subas `middlewareClientMaxBodySize` para arreglarlo: obligaría a bufferizar el
+audio entero en memoria, contra un heap de 384 MB. El middleware sólo crea la
+cookie `session_id`, que ya se genera al cargar la página; las rutas de API se
+limitan a leerla.
+
+### `invalid header value` con una clave de API
+
+```
+Headers.append: "sk-ant-…
+CLEANUP_MODEL=claude-haiku-4-5" is an invalid header value.
+```
+
+El valor de la variable lleva pegada la línea siguiente: pasa al copiar varias
+líneas del `.env` en el campo de una sola variable. Vuelve a pegar sólo la clave.
+
+`src/lib/env.ts` ahora recorta los espacios de los bordes y **rechaza al arrancar**
+cualquier variable con un salto de línea en medio, en vez de dejar que reviente a
+mitad de un trabajo. Y todo error de terceros pasa por `src/lib/redact.ts` antes
+de llegar a consola: el SDK de Anthropic incluía la clave entera en ese mensaje y
+acabó en los logs de despliegue.
+
+> Si ves una credencial en tus logs, **revócala**. Anthropic: console → Settings →
+> API Keys. Groq: console → API Keys. Railway/Postgres: Variables → regenerar.
 
 ### `403` al subir el segundo audio seguido
 

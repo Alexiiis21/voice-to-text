@@ -37,6 +37,33 @@ export const transcriptions = pgTable(
      * envía el cliente para construir una ruta.
      */
     sourceExt: text('source_ext').notNull(),
+    /**
+     * URL del audio original en Vercel Blob.
+     *
+     * En el despliegue de Railway el audio vivía en el volumen y la ruta se
+     * derivaba del id. En Vercel no hay disco compartido entre invocaciones:
+     * el cliente sube directamente a Blob y aquí se guarda la URL resultante.
+     * Se pone a NULL cuando el audio se borra al terminar (§6).
+     */
+    sourceUrl: text('source_url'),
+    /**
+     * URL del audio ya normalizado (mono 16 kHz mp3 32 kbps) en Vercel Blob.
+     *
+     * Normalizar un audio largo cuesta minutos, así que el resultado se sube a
+     * Blob: si el trabajo no cabe en una invocación, la siguiente se lo baja en
+     * vez de volver a normalizar desde cero.
+     */
+    normalizedUrl: text('normalized_url'),
+    /**
+     * IP que subió el audio, **sólo mientras el trabajo está en vuelo**.
+     *
+     * El límite de "2 horas de audio por hora e IP" necesita la duración real,
+     * y con la subida directa a Blob la duración ya no se conoce al encolar:
+     * sale del `probeAudio` que hace el procesado. Así que la IP viaja con el
+     * trabajo hasta ese momento y se pone a NULL en cuanto se contabiliza.
+     * No es histórico: una fila terminada nunca conserva la IP.
+     */
+    clientIp: text('client_ip'),
     sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
     durationSec: integer('duration_sec'),
     status: transcriptionStatusEnum('status').notNull().default('queued'),

@@ -41,6 +41,9 @@ function normalizeTranscription(row: Record<string, unknown>): Transcription {
     sessionId: row.session_id as string,
     filename: row.filename as string,
     sourceExt: row.source_ext as string,
+    sourceUrl: (row.source_url as string | null) ?? null,
+    normalizedUrl: (row.normalized_url as string | null) ?? null,
+    clientIp: (row.client_ip as string | null) ?? null,
     sizeBytes: Number(row.size_bytes),
     durationSec: row.duration_sec === null ? null : Number(row.duration_sec),
     status: row.status as Transcription['status'],
@@ -78,6 +81,41 @@ export async function requeueOrphanedJobs(): Promise<number> {
   return result.length;
 }
 
+/**
+ * Devuelve a la cola los trabajos atascados en vuelo más de `olderThanMs`.
+ *
+ * Es el equivalente serverless de `requeueOrphanedJobs`, y **no puede ser tan
+ * agresivo**: en Railway el arranque del contenedor garantizaba que no había
+ * ningún worker vivo, así que se podían requeuear todos. Aquí puede haber una
+ * invocación de `/api/process` trabajando legítimamente sobre un trabajo en
+ * `processing`, así que sólo se rescata lo que lleva parado más que el
+ * `maxDuration` de la función: si sigue ahí después de eso, la invocación murió
+ * (timeout duro, OOM) sin poder devolverlo a la cola.
+ */
+export async function requeueStaleJobs(olderThanMs: number): Promise<number> {
+  const cutoff = new Date(Date.now() - olderThanMs);
+  const rows = await sql<{ id: string }[]>`
+    UPDATE transcriptions
+    SET status = 'queued', started_at = NULL
+    WHERE status IN ('processing', 'editing')
+      AND COALESCE(started_at, created_at) < ${cutoff}
+    RETURNING id
+  `;
+  return rows.length;
+}
+
+/** ¿Queda algo reclamable ahora mismo? Decide si encadenar otra invocación. */
+export async function hasClaimableWork(): Promise<boolean> {
+  const rows = await sql<{ exists: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1 FROM transcriptions
+      WHERE status = 'queued'
+        AND (resume_after IS NULL OR resume_after <= now())
+    ) AS exists
+  `;
+  return rows[0]?.exists === true;
+}
+
 export async function markFailed(id: string, message: string): Promise<void> {
   await db
     .update(transcriptions)
@@ -110,6 +148,26 @@ export async function setStatus(
   extra: Partial<Pick<Transcription, 'error' | 'completedAt'>> = {},
 ): Promise<void> {
   await db.update(transcriptions).set({ status, ...extra }).where(eq(transcriptions.id, id));
+}
+
+/**
+ * Guarda (o borra) las URLs de Blob. Se pasan sólo las que cambian: escribir
+ * `normalizedUrl` no debe pisar `sourceUrl` puesto por otra invocación.
+ */
+export async function setBlobUrls(
+  id: string,
+  values: Partial<Pick<Transcription, 'sourceUrl' | 'normalizedUrl'>>,
+): Promise<void> {
+  if (Object.keys(values).length === 0) return;
+  await db.update(transcriptions).set(values).where(eq(transcriptions.id, id));
+}
+
+/**
+ * Olvida la IP en cuanto se han contabilizado los segundos de audio. La columna
+ * existe sólo para cerrar ese cálculo, no como registro (ver el esquema).
+ */
+export async function clearClientIp(id: string): Promise<void> {
+  await db.update(transcriptions).set({ clientIp: null }).where(eq(transcriptions.id, id));
 }
 
 export async function setDuration(id: string, durationSec: number): Promise<void> {
@@ -177,9 +235,19 @@ export async function setTexts(
 /** Transcripciones más antiguas que `cutoff`, para el barrido de retención. */
 export async function findExpired(
   cutoff: Date,
-): Promise<{ id: string; sourceExt: string }[]> {
+): Promise<
+  { id: string; sourceExt: string; sourceUrl: string | null; normalizedUrl: string | null }[]
+> {
   return db
-    .select({ id: transcriptions.id, sourceExt: transcriptions.sourceExt })
+    .select({
+      id: transcriptions.id,
+      sourceExt: transcriptions.sourceExt,
+      // Normalmente ya están a NULL (el audio se borra al terminar), pero un
+      // trabajo que falló de forma rara puede dejar el blob vivo. El barrido es
+      // la última red: sin esto el almacenamiento crecería para siempre.
+      sourceUrl: transcriptions.sourceUrl,
+      normalizedUrl: transcriptions.normalizedUrl,
+    })
     .from(transcriptions)
     .where(lt(transcriptions.createdAt, cutoff));
 }

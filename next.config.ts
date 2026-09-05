@@ -2,15 +2,43 @@ import type { NextConfig } from 'next';
 import path from 'node:path';
 
 const nextConfig: NextConfig = {
-  // Imagen final mínima en Railway: sólo el server + las dependencias trazadas.
-  output: 'standalone',
+  /**
+   * `standalone` sólo tiene sentido fuera de Vercel.
+   *
+   * Es lo que produce el `server.js` autocontenido que arranca
+   * `scripts/start.mjs` dentro del contenedor. En Vercel estorba: la plataforma
+   * empaqueta cada ruta como su propia función y el trazado ya lo hace ella.
+   * Condicionarlo mantiene vivo el camino del Dockerfile por si hace falta
+   * volver a un contenedor, sin penalizar el despliegue normal.
+   */
+  output: process.env.VERCEL ? undefined : 'standalone',
+
   // Ancla el trazado a este proyecto: si hay otro lockfile más arriba en el
-  // árbol, Next elige ese directorio como raíz y el standalone sale mal.
+  // árbol, Next elige ese directorio como raíz y el trazado sale mal.
   outputFileTracingRoot: path.resolve(import.meta.dirname),
+
+  /**
+   * El binario de ffmpeg tiene que viajar dentro de la función que lo ejecuta.
+   *
+   * El trazado automático de Next no lo encuentra: `@ffmpeg-installer/ffmpeg`
+   * resuelve la ruta del paquete de la plataforma en tiempo de ejecución
+   * (`createRequire` sobre un nombre construido con `os.platform()`), y un
+   * analizador estático no puede seguir eso. Sin esta inclusión explícita el
+   * despliegue construye bien y luego falla en ejecución con un ENOENT.
+   *
+   * Se incluye **sólo** en las rutas que ejecutan ffmpeg. Son ~78 MB y el
+   * límite de una función serverless son 250 MB descomprimidos: meterlo en
+   * todas las rutas se lo comería sin necesidad.
+   */
+  outputFileTracingIncludes: {
+    '/api/process': ['./node_modules/@ffmpeg-installer/**/*'],
+    '/api/cron': ['./node_modules/@ffmpeg-installer/**/*'],
+  },
+
   reactStrictMode: true,
   poweredByHeader: false,
   // Estos paquetes usan APIs nativas de Node y no deben pasar por el bundler del server.
-  serverExternalPackages: ['postgres', 'busboy'],
+  serverExternalPackages: ['postgres', '@ffmpeg-installer/ffmpeg'],
   eslint: {
     dirs: ['src', 'scripts'],
   },

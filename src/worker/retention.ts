@@ -1,4 +1,5 @@
 import { WORKER } from '@/lib/config';
+import { deleteBlobs } from '@/lib/blob';
 import { removeTranscriptionFiles } from '@/lib/files';
 import { purgeOldWindows } from '@/lib/rate-limit';
 import * as repo from './repo';
@@ -31,6 +32,7 @@ export async function maybeRunRetentionSweep(force = false): Promise<boolean> {
 
   for (const row of expired) {
     await removeTranscriptionFiles(row.id, row.sourceExt);
+    await deleteBlobs([row.sourceUrl, row.normalizedUrl]);
     await repo.deleteTranscriptionRow(row.id);
   }
 

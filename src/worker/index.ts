@@ -1,16 +1,23 @@
 /**
- * Bucle del worker.
+ * Bucle del worker, para desarrollo local (`npm run dev:worker`).
  *
- * Vive en el mismo contenedor que el servidor de Next (ver README, §
- * "Dos procesos en un servicio"). Sondea la cola de Postgres cada 5 s cuando
- * está vacía; cuando hay trabajo, itera sin esperar.
+ * **En Vercel esto no corre.** No hay dónde tener un proceso vivo: el procesado
+ * lo hace `src/app/api/process/route.ts`, que llama al mismo `processJob` pero
+ * a plazos, con un presupuesto de tiempo por invocación. Este bucle se conserva
+ * porque en local es mucho más cómodo —arranca una vez y va vaciando la cola
+ * sola— y porque es lo que necesita el despliegue en contenedor, que sigue
+ * disponible vía Dockerfile.
+ *
+ * Sondea la cola de Postgres cada 5 s cuando está vacía; cuando hay trabajo,
+ * itera sin esperar.
  */
 import { WORKER } from '@/lib/config';
 import { env } from '@/lib/env';
-import { ensureDataDirs, removeTranscriptionFiles } from '@/lib/files';
+import { ensureDataDirs } from '@/lib/files';
+import { safeErrorMessage } from '@/lib/redact';
 import { sql } from '@/db';
 import * as repo from './repo';
-import { JobDeferred, JobInterrupted, processJob, type StopSignal } from './process';
+import { discardAudio, JobDeferred, JobInterrupted, processJob, type StopSignal } from './process';
 import { maybeRunRetentionSweep } from './retention';
 
 let shuttingDown = false;
@@ -25,7 +32,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return safeErrorMessage(error);
 }
 
 async function tick(): Promise<boolean> {
@@ -52,7 +59,7 @@ async function tick(): Promise<boolean> {
       // El audio se borra siempre al terminar la transcripción, con éxito o
       // sin él (§6). Un fallo duro aborta antes de la limpieza normal, así que
       // se hace aquí.
-      await removeTranscriptionFiles(job.id, job.sourceExt);
+      await discardAudio(job.id, job.sourceExt, [job.sourceUrl, job.normalizedUrl]);
       await repo.markFailed(job.id, message);
     }
   } finally {

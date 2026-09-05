@@ -5,6 +5,7 @@ import { chunks, transcriptions } from '@/db/schema';
 import { SUMMARY_MAP_REDUCE_WORDS } from '@/lib/config';
 import { anthropicConfigured, summarize, summarizePartial } from '@/lib/claude';
 import { toCostString } from '@/lib/cost';
+import { safeErrorMessage } from '@/lib/redact';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -124,7 +125,7 @@ export async function POST(_request: Request, { params }: Params): Promise<NextR
       summaryText = combined.text;
     }
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = safeErrorMessage(error);
     console.error(`[api] Resumen de ${id} falló:`, message);
     return NextResponse.json({ error: `No se pudo generar el resumen: ${message}` }, { status: 502 });
   }

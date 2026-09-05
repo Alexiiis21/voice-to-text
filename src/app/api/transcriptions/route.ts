@@ -3,27 +3,15 @@ import { desc, eq } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import { db } from '@/db';
 import { transcriptions } from '@/db/schema';
-import { ALLOWED_MIME_TYPES, HISTORY_LIMIT } from '@/lib/config';
-import { env } from '@/lib/env';
-import {
-  ensureDataDirs,
-  removeQuietly,
-  uploadPath,
-  validatedExtension,
-} from '@/lib/files';
-import { probeAudio } from '@/lib/ffmpeg';
-import {
-  clientIp,
-  commitAudioSeconds,
-  readQuota,
-  releaseTranscription,
-  reserveTranscription,
-} from '@/lib/rate-limit';
+import { HISTORY_LIMIT } from '@/lib/config';
+import { deleteBlobs, isBlobUrl, statBlob } from '@/lib/blob';
+import { validatedExtension } from '@/lib/files';
+import { clientIp, readQuota, releaseTranscription } from '@/lib/rate-limit';
+import { safeErrorMessage } from '@/lib/redact';
 import { readSessionId } from '@/lib/session';
 import { toView } from '@/lib/serialize';
 import { defaultProviderName, normalizeRequestedProvider } from '@/lib/stt';
-import { verifyTurnstile } from '@/lib/turnstile';
-import { parseUpload, UploadError } from '@/lib/upload';
+import { triggerProcessing } from '@/lib/trigger';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -45,110 +33,84 @@ export async function GET(): Promise<NextResponse> {
   return NextResponse.json({ items: rows.map(toView) });
 }
 
+interface ConfirmBody {
+  blobUrl?: unknown;
+  filename?: unknown;
+  sttProvider?: unknown;
+}
+
 /**
- * Sube un audio y lo encola.
+ * Confirma un audio ya subido a Blob y lo encola.
  *
- * Orden estricto: Turnstile → rate limit → escritura en streaming a disco →
- * validación con ffprobe → INSERT con status='queued' → 202 { id }.
+ * El audio **no pasa por aquí**: el navegador lo sube directo a Vercel Blob con
+ * un token que emite `/api/blob/upload` (ahí se hacen Turnstile y rate limit).
+ * Esta ruta sólo recibe la URL resultante, comprueba que es nuestra y crea la
+ * fila. Por eso es rápida y no le afecta el límite de 4,5 MB de cuerpo.
+ *
+ * Lo que **ya no** se hace aquí, a diferencia del despliegue en contenedor:
+ * validar el audio con ffprobe. Para eso habría que descargar el fichero
+ * entero, y son cientos de MB; la validación la hace `/api/process` con el
+ * `probeAudio` que ya necesita para trocear. Un fichero que no sea audio de
+ * verdad se rechaza ahí y la transcripción queda `failed` con el motivo.
  */
 export async function POST(request: Request): Promise<NextResponse> {
-  const contentType = request.headers.get('content-type') ?? '';
-  if (!contentType.toLowerCase().startsWith('multipart/form-data')) {
+  const sessionId = (await readSessionId()) ?? randomUUID();
+  const ip = clientIp(request.headers);
+
+  let body: ConfirmBody;
+  try {
+    body = (await request.json()) as ConfirmBody;
+  } catch {
+    return NextResponse.json({ error: 'Cuerpo ilegible' }, { status: 400 });
+  }
+
+  const blobUrl = typeof body.blobUrl === 'string' ? body.blobUrl : '';
+  const rawFilename = typeof body.filename === 'string' ? body.filename : '';
+
+  // Entrada no confiable: sin esta comprobación le pasaríamos a `fetch` una URL
+  // arbitraria desde el servidor (SSRF).
+  if (!isBlobUrl(blobUrl)) {
+    return NextResponse.json({ error: 'La URL del audio no es válida' }, { status: 400 });
+  }
+
+  const ext = validatedExtension(rawFilename);
+  if (!ext) {
     return NextResponse.json(
-      { error: 'Se esperaba multipart/form-data' },
+      {
+        error:
+          'Formato no soportado. Formatos válidos: .ogg .opus .mp3 .m4a .wav .webm .aac .flac',
+      },
       { status: 400 },
     );
   }
 
-  if (!request.body) {
-    return NextResponse.json({ error: 'Petición sin cuerpo' }, { status: 400 });
-  }
-
-  const sessionId = (await readSessionId()) ?? randomUUID();
-  const ip = clientIp(request.headers);
-  const maxBytes = env.maxUploadMb * 1024 * 1024;
-
-  await ensureDataDirs();
-
-  const id = randomUUID();
-  let destination: string | null = null;
-  let reserved = false;
-  // Motor elegido en el selector del panel de entrada. Si el cliente manda
-  // algo que no está configurado en el servidor, se ignora y se usa el
-  // primero de la cadena: el cliente no puede forzar un proveedor sin clave.
-  let requestedProvider = defaultProviderName();
+  // Motor elegido en el selector del panel de entrada. Si el cliente manda algo
+  // que no está configurado en el servidor, se ignora y se usa el primero de la
+  // cadena: el cliente no puede forzar un proveedor sin clave.
+  const requestedProvider =
+    normalizeRequestedProvider(typeof body.sttProvider === 'string' ? body.sttProvider : null) ??
+    defaultProviderName();
 
   try {
-    const upload = await parseUpload(request.body, contentType, maxBytes, {
-      async onFileStart({ fields, filename, mimeType }) {
-        // 1. Turnstile.
-        const turnstile = await verifyTurnstile(fields.turnstileToken ?? null, ip);
-        if (!turnstile.ok) {
-          throw new UploadError(turnstile.reason ?? 'Verificación antibot fallida', 403);
-        }
+    // `head` va firmado con nuestro token: confirma que el blob existe y es de
+    // nuestro almacén, no sólo que la URL tiene la forma correcta.
+    const stat = await statBlob(blobUrl);
 
-        // 2. Allowlist de extensión y MIME.
-        const ext = validatedExtension(filename);
-        if (!ext) {
-          throw new UploadError(
-            'Formato no soportado. Formatos válidos: .ogg .opus .mp3 .m4a .wav .webm .aac .flac',
-            400,
-          );
-        }
-        const normalizedMime = mimeType.split(';')[0]?.trim().toLowerCase() ?? '';
-        if (normalizedMime !== '' && !ALLOWED_MIME_TYPES.has(normalizedMime)) {
-          throw new UploadError(`Tipo MIME no permitido: ${normalizedMime}`, 400);
-        }
-
-        // 3. Motor pedido (opcional).
-        requestedProvider = normalizeRequestedProvider(fields.sttProvider) ?? defaultProviderName();
-
-        // 4. Rate limit por IP.
-        const decision = await reserveTranscription(ip);
-        if (!decision.allowed) {
-          throw new UploadError(decision.reason ?? 'Límite de uso alcanzado', 429);
-        }
-        reserved = true;
-
-        destination = uploadPath(id, ext);
-        return { destination };
-      },
-    });
-
-    const ext = validatedExtension(upload.filename);
-    if (!ext || !destination) {
-      throw new UploadError('No se pudo determinar la extensión del archivo', 400);
+    if (stat.size === 0) {
+      await deleteBlobs([blobUrl]);
+      return NextResponse.json({ error: 'El archivo está vacío' }, { status: 400 });
     }
 
-    if (upload.bytesWritten === 0) {
-      throw new UploadError('El archivo está vacío', 400);
-    }
-
-    // 4. ffprobe ANTES de encolar: protege de archivos disfrazados de audio.
-    let durationSec: number;
-    try {
-      const probe = await probeAudio(destination);
-      durationSec = probe.durationSec;
-    } catch {
-      throw new UploadError(
-        'ffprobe no reconoce ningún stream de audio en el archivo. ' +
-          'Comprueba que es un audio válido y no está corrupto.',
-        400,
-      );
-    }
-
-    await commitAudioSeconds(ip, durationSec);
-
-    // 5. Encolar.
     const [row] = await db
       .insert(transcriptions)
       .values({
-        id,
+        id: randomUUID(),
         sessionId,
-        filename: upload.filename.slice(0, 255),
+        filename: rawFilename.slice(0, 255),
         sourceExt: ext,
-        sizeBytes: upload.bytesWritten,
-        durationSec: Math.round(durationSec),
+        sourceUrl: blobUrl,
+        clientIp: ip,
+        sizeBytes: stat.size,
         status: 'queued',
         sttProvider: requestedProvider,
       })
@@ -156,23 +118,20 @@ export async function POST(request: Request): Promise<NextResponse> {
 
     if (!row) throw new Error('No se pudo crear el registro de la transcripción');
 
+    // Despertar al procesador. Es fire-and-forget: si se pierde, el cron lo
+    // recoge (ver src/lib/trigger.ts).
+    await triggerProcessing();
+
     const quota = await readQuota(ip);
     return NextResponse.json({ id: row.id, transcription: toView(row), quota }, { status: 202 });
   } catch (error: unknown) {
-    if (destination) await removeQuietly(destination);
-    if (reserved) await releaseTranscription(ip);
+    // La reserva del rate limit se hizo al emitir el token; si no llegamos a
+    // encolar, se devuelve.
+    await releaseTranscription(ip);
+    await deleteBlobs([blobUrl]);
 
-    if (error instanceof UploadError) {
-      const headers: Record<string, string> = {};
-      if (error.status === 429) {
-        const quota = await readQuota(ip);
-        headers['Retry-After'] = String(quota.resetInSec);
-      }
-      return NextResponse.json({ error: error.message }, { status: error.status, headers });
-    }
-
-    const message = error instanceof Error ? error.message : String(error);
-    console.error('[api] Error subiendo audio:', message);
-    return NextResponse.json({ error: `Error procesando la subida: ${message}` }, { status: 500 });
+    const message = safeErrorMessage(error);
+    console.error('[api] Error encolando el audio:', message);
+    return NextResponse.json({ error: `No se pudo encolar el audio: ${message}` }, { status: 500 });
   }
 }
