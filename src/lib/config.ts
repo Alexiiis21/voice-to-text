@@ -122,6 +122,16 @@ export const WORKER = {
 /** Umbral de map-reduce para el resumen (§4). */
 export const SUMMARY_MAP_REDUCE_WORDS = 40_000;
 
+/**
+ * Bloques del resumen resueltos a la vez en la etapa "map".
+ *
+ * Son llamadas independientes, así que hacerlas en fila sólo sumaba latencia:
+ * una transcripción de 100.000 palabras son ~10 bloques, y en secuencia no
+ * caben en el `maxDuration` de 300 s del plan Hobby. Con 3 en vuelo sí, y se
+ * queda lejos del límite de peticiones por minuto de Anthropic.
+ */
+export const SUMMARY_MAP_CONCURRENCY = 3;
+
 /** Tarifas estimadas para la columna `cost_usd` (USD). */
 export const PRICING = {
   stt: {

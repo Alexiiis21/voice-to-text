@@ -8,3 +8,6 @@ out
 next-env.d.ts
 data
 coverage
+
+.vercel
+.env*

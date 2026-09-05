@@ -13,7 +13,7 @@
     "build:server": "node scripts/build-server.mjs",
     "start": "node scripts/start.mjs",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "node --experimental-strip-types --env-file-if-exists=.env src/db/migrate.ts",
+    "db:migrate": "node scripts/build-server.mjs && node --env-file-if-exists=.env dist/migrate.js",
     "lint": "eslint src scripts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

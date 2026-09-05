@@ -2,14 +2,27 @@ import { NextResponse } from 'next/server';
 import { asc, eq } from 'drizzle-orm';
 import { db, sql } from '@/db';
 import { chunks, transcriptions } from '@/db/schema';
-import { SUMMARY_MAP_REDUCE_WORDS } from '@/lib/config';
+import { SUMMARY_MAP_CONCURRENCY, SUMMARY_MAP_REDUCE_WORDS } from '@/lib/config';
 import { anthropicConfigured, summarize, summarizePartial } from '@/lib/claude';
+import { mapWithConcurrency } from '@/lib/concurrency';
 import { toCostString } from '@/lib/cost';
 import { safeErrorMessage } from '@/lib/redact';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 800;
+
+/**
+ * 300 s es el techo del plan Hobby. Estaba en 800 —el techo de Pro— y eso
+ * **rechazaba el despliegue entero**, no sólo esta ruta:
+ *
+ *     Error: Builder returned invalid maxDuration value for Serverless Function
+ *     "api/transcriptions/[id]/summary". Serverless Functions must have a
+ *     maxDuration between 1 and 300 for plan hobby.
+ *
+ * Para que 300 s basten, la etapa "map" del resumen va en paralelo acotado en
+ * vez de en fila (ver abajo).
+ */
+export const maxDuration = 300;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -105,9 +118,16 @@ export async function POST(_request: Request, { params }: Params): Promise<NextR
           ? groupForMapReduce(parts, Math.floor(SUMMARY_MAP_REDUCE_WORDS / 4))
           : groupForMapReduce([source], Math.floor(SUMMARY_MAP_REDUCE_WORDS / 4));
 
+      // Los bloques son independientes: se resuelven en paralelo acotado. En
+      // fila, una transcripción larga no cabía en el maxDuration de la función.
+      // `mapWithConcurrency` conserva el orden de entrada, que aquí es
+      // imprescindible: son trozos consecutivos del mismo texto.
+      const calls = await mapWithConcurrency(groups, SUMMARY_MAP_CONCURRENCY, (group) =>
+        summarizePartial(group),
+      );
+
       const partials: string[] = [];
-      for (const group of groups) {
-        const call = await summarizePartial(group);
+      for (const call of calls) {
         cost += call.costUsd;
         if (call.text !== '') partials.push(call.text);
       }

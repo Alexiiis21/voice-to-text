@@ -320,15 +320,14 @@ lo dicen explícitamente.
 Postgres gestionado, desde **Storage** en el panel de Vercel (Neon) o desde
 <https://neon.tech> directamente. Copia la cadena de conexión.
 
-> ⚠️ **Quita `channel_binding=require` de la cadena que copies.** Neon la incluye
-> por defecto. `postgres.js` manda al servidor todo parámetro de la URL que no
-> reconoce, y `channel_binding` no es un parámetro de servidor: Postgres cierra
-> la conexión con `unrecognized configuration parameter "channel_binding"`.
-> Deja `sslmode=require`, que sí lo entiende.
->
-> Usa además la URL **directa**, no la del pooler (la que *no* lleva `-pooler`
-> en el host): el techo de conexiones de esta app es bajo y las migraciones van
-> más tranquilas sin PgBouncer por medio.
+La cadena que da Neon sirve **tal cual**, con `channel_binding=require` y
+`sslmode=require`, y tanto la directa como la del pooler funcionan (probado con
+la del pooler, migraciones incluidas).
+
+Lo que sí importa y ya está en el código: `prepare: false` en
+[`src/db/index.ts`](src/db/index.ts) y en [`src/db/migrate.ts`](src/db/migrate.ts).
+Sin eso, las sentencias preparadas chocan con un pooler en modo transacción. Con
+eso, la URL del pooler es una opción perfectamente válida.
 
 ### 6.2 Almacenamiento del audio
 
@@ -379,12 +378,18 @@ cuota de Groq. `/api/health` avisa con `processProtected: false`.
 
 **Este es el paso que Vercel no hace por ti.** En el contenedor, las migraciones
 corrían al arrancar (`scripts/start.mjs`). Vercel no ejecuta ese script: sólo
-empaqueta las rutas. Así que se aplican a mano, una vez, y luego sólo cuando
-cambie el esquema:
+empaqueta las rutas. Si te saltas esto, el despliegue sube bien y luego toda
+ruta que toque la base responde 500 con `relation "transcriptions" does not
+exist`.
+
+Se aplican a mano, una vez, y luego sólo cuando cambie el esquema. Con la
+`DATABASE_URL` en el `.env` local basta con:
 
 ```bash
-DATABASE_URL="postgresql://…?sslmode=require" npm run db:migrate
+npm run db:migrate
 ```
+
+Es idempotente: si ya están aplicadas responde `Migraciones al día`.
 
 ### 6.5 Desplegar
 
@@ -422,24 +427,18 @@ Las tres consecuencias que conviene tener presentes:
    lo hace la confirmación de la subida, lo hace el SSE mientras el usuario
    espera con la pestaña abierta, y como última red lo hace el cron.
 
-3. **No hay cron configurado.** La ruta `/api/cron` existe y hace su trabajo
-   (rescatar trabajos atascados, barrido de retención), pero **no se declara en
-   `vercel.json`**: en plan Hobby los cron están limitados a 2 *por cuenta*, y
-   declarar uno más de la cuenta hace que Vercel rechace el despliegue entero
-   con un genérico *"project or build error"*, sin detalle en el log del build.
+3. **El cron del plan Hobby corre una vez al día.** Suficiente para la limpieza
+   (rescatar trabajos atascados, barrido de retención), pero inservible como
+   planificador. Por eso el camino normal es el disparo directo. Con plan Pro se
+   puede bajar `schedule` en `vercel.json` a `*/5 * * * *` y el cron pasa a ser
+   también un planificador decente. Como alternativa, cualquier servicio externo
+   puede llamar a `GET /api/cron` con la cabecera `x-process-secret`.
 
-   No es crítico, porque el camino normal para despertar el procesado es el
-   disparo directo desde la subida y desde el SSE. Para activarlo cuando haya
-   hueco (o con plan Pro), crea `vercel.json`:
-
-   ```json
-   { "crons": [{ "path": "/api/cron", "schedule": "0 4 * * *" }] }
-   ```
-
-   Con Pro se puede bajar a `*/5 * * * *` y el cron pasa a ser también un
-   planificador decente. Como alternativa sin cron de Vercel, cualquier
-   servicio externo puede llamar a `GET /api/cron` con la cabecera
-   `x-process-secret`.
+> **Si un despliegue falla con un genérico "project or build error"** y el log
+> del build termina en `Deploying outputs...` sin más, el motivo real no está
+> ahí: sácalo con `npx vercel deploy --prod`, que lo imprime en claro. Así
+> apareció que `maxDuration = 800` en la ruta del resumen (el techo de Pro)
+> tumbaba el despliegue entero en plan Hobby, donde el máximo son 300.
 
 ### Coste
 

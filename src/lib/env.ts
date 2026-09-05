@@ -124,10 +124,39 @@ function resolveDatabaseUrl(): string {
  *
  * En Railway era el volumen persistente `/data`. En Vercel el único sitio
  * escribible es `/tmp`, y sólo dentro de la invocación en curso: lo que tiene
- * que sobrevivir va a Blob (ver ./blob.ts). `DATA_DIR` se sigue respetando para
- * poder desplegar en un contenedor con volumen sin tocar código.
+ * que sobrevivir va a Blob (ver ./blob.ts).
  */
 const DEFAULT_DATA_DIR = path.join(os.tmpdir(), 'transcriptor');
+
+/**
+ * En Vercel se **ignora `DATA_DIR`** a propósito.
+ *
+ * Al migrar desde Railway la variable se arrastra con su valor viejo (`/data`),
+ * y ahí eso no es una preferencia sino una avería: el filesystem de una función
+ * es de sólo lectura fuera de `/tmp`, así que el `mkdir` de `ensureDataDirs`
+ * falla con EROFS y `/api/process` se cae nada más entrar, en cada invocación.
+ *
+ * Como en Vercel no existe ningún destino válido salvo `/tmp`, respetar la
+ * variable no puede mejorar nada y sí puede romperlo todo. Fuera de Vercel se
+ * sigue honrando, que es lo que necesita el despliegue en contenedor con
+ * volumen.
+ */
+function resolveDataDir(): string {
+  const configured = optional('DATA_DIR');
+  if (configured === null) return DEFAULT_DATA_DIR;
+
+  if (process.env.VERCEL) {
+    if (configured !== DEFAULT_DATA_DIR) {
+      console.warn(
+        `[env] DATA_DIR=${configured} se ignora en Vercel: sólo /tmp es escribible. ` +
+          `Se usa ${DEFAULT_DATA_DIR}. Puedes borrar la variable del proyecto.`,
+      );
+    }
+    return DEFAULT_DATA_DIR;
+  }
+
+  return configured;
+}
 
 /**
  * URL base de la propia aplicación, para que `/api/process` pueda re-invocarse
@@ -149,7 +178,7 @@ function resolveAppUrl(): string | null {
 
 export const env = {
   databaseUrl: resolveDatabaseUrl(),
-  dataDir: str('DATA_DIR', DEFAULT_DATA_DIR),
+  dataDir: resolveDataDir(),
 
   appUrl: resolveAppUrl(),
   /**

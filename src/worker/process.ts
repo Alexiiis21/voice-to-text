@@ -22,6 +22,7 @@ import {
   type SttAdapter,
 } from '@/lib/stt';
 import { sttCostUsd } from '@/lib/cost';
+import { mapWithConcurrency } from '@/lib/concurrency';
 import { commitAudioSeconds } from '@/lib/rate-limit';
 import { anthropicConfigured, cleanupChunk } from '@/lib/claude';
 import { safeErrorMessage } from '@/lib/redact';
@@ -228,25 +229,6 @@ async function transcribeChunkWithChain(
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
-
-/** Ejecuta `tasks` con concurrencia acotada. */
-async function mapWithConcurrency<T>(
-  items: readonly T[],
-  limit: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  let cursor = 0;
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
-      const index = cursor;
-      cursor += 1;
-      const item = items[index];
-      if (item === undefined) return;
-      await worker(item);
-    }
-  });
-  await Promise.all(runners);
 }
 
 /**
