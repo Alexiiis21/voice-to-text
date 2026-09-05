@@ -26,13 +26,15 @@ const nextConfig: NextConfig = {
    * analizador estático no puede seguir eso. Sin esta inclusión explícita el
    * despliegue construye bien y luego falla en ejecución con un ENOENT.
    *
-   * Se incluye **sólo** en las rutas que ejecutan ffmpeg. Son ~78 MB y el
-   * límite de una función serverless son 250 MB descomprimidos: meterlo en
-   * todas las rutas se lo comería sin necesidad.
+   * Se incluye **sólo en `/api/process`**, que es la única ruta que lo ejecuta.
+   * Son 68 MB en Linux y el límite de una función serverless son 250 MB
+   * descomprimidos, así que repartirlo por rutas que no lo usan es peso muerto:
+   * `/api/cron` no llega a ffmpeg por ninguna vía de import (sólo toca la base
+   * de datos y Blob), y `/api/health` sólo pregunta por él —y por eso reporta
+   * `ffmpeg: false`, que ahí es lo esperado—.
    */
   outputFileTracingIncludes: {
     '/api/process': ['./node_modules/@ffmpeg-installer/**/*'],
-    '/api/cron': ['./node_modules/@ffmpeg-installer/**/*'],
   },
 
   reactStrictMode: true,

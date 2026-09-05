@@ -17,6 +17,8 @@
  * sacan del propio ffmpeg (ver `probeAudio` en ./ffmpeg.ts).
  */
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createRequire } from 'node:module';
 
 /** Cacheado a nivel de módulo: se resuelve una vez por invocación en frío. */
@@ -59,8 +61,7 @@ export function ffmpegPath(): string {
 
   const fromInstaller = resolveFromInstaller();
   if (fromInstaller !== null) {
-    ensureExecutable(fromInstaller);
-    cached = fromInstaller;
+    cached = makeExecutable(fromInstaller);
     return cached;
   }
 
@@ -68,24 +69,70 @@ export function ffmpegPath(): string {
   return cached;
 }
 
+/** Copia de trabajo cuando el binario original no se puede marcar ejecutable. */
+const STAGED_BINARY = path.join(os.tmpdir(), 'transcriptor-bin', 'ffmpeg');
+
 /**
- * Asegura el bit de ejecución.
+ * Devuelve una ruta a un ffmpeg que **se puede ejecutar de verdad**.
  *
- * npm conserva los permisos del tarball, así que normalmente ya viene con +x.
- * Pero el bundle de una función serverless se reempaqueta por el camino y hay
- * despliegues donde el bit se pierde; un `chmod` de más no cuesta nada y evita
- * un EACCES a mitad de un trabajo.
+ * El problema concreto: `@ffmpeg-installer/linux-x64` da el permiso de
+ * ejecución en un `postinstall` (`chmod u+x ffmpeg`), porque los tarballs de
+ * npm no conservan ese bit de forma fiable. **Vercel bloquea los install
+ * scripts** —lo dice el propio log del build:
+ *
+ *     npm warn allow-scripts @ffmpeg-installer/linux-x64@4.1.0 (postinstall: chmod u+x ffmpeg)
+ *
+ * así que en Vercel el binario llega sin permiso de ejecución. Y arreglarlo en
+ * caliente con un `chmod` sobre el original tampoco vale: el filesystem de una
+ * función es de sólo lectura salvo `/tmp`.
+ *
+ * De ahí la copia a `/tmp`, que es el único sitio escribible. Cuesta unos
+ * cientos de ms la primera vez y nada mientras la instancia siga caliente.
+ * Fuera de Vercel no se llega a copiar nunca: el binario ya viene ejecutable o
+ * el `chmod` sobre el original funciona.
  */
-function ensureExecutable(binaryPath: string): void {
-  if (process.platform === 'win32') return;
+function makeExecutable(source: string): string {
+  if (process.platform === 'win32') return source;
+
+  // 1. ¿Ya se puede ejecutar? Es el caso normal en local y en un contenedor.
   try {
-    fs.accessSync(binaryPath, fs.constants.X_OK);
+    fs.accessSync(source, fs.constants.X_OK);
+    return source;
   } catch {
-    try {
-      fs.chmodSync(binaryPath, 0o755);
-    } catch {
-      // Sistema de ficheros de sólo lectura: si de verdad falta el permiso, el
-      // spawn dará un error claro. No hay nada más que hacer aquí.
-    }
+    // Sigue.
+  }
+
+  // 2. ¿Se puede arreglar en el sitio? Vale en cualquier sistema de ficheros
+  //    escribible; en Vercel lanzará EROFS y caemos al paso 3.
+  try {
+    fs.chmodSync(source, 0o755);
+    fs.accessSync(source, fs.constants.X_OK);
+    return source;
+  } catch {
+    // Sigue.
+  }
+
+  // 3. Copia a /tmp. Si ya está de una invocación anterior en la misma
+  //    instancia, se reutiliza.
+  try {
+    fs.accessSync(STAGED_BINARY, fs.constants.X_OK);
+    return STAGED_BINARY;
+  } catch {
+    // No está todavía.
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(STAGED_BINARY), { recursive: true });
+    fs.copyFileSync(source, STAGED_BINARY);
+    fs.chmodSync(STAGED_BINARY, 0o755);
+    console.log(`[ffmpeg] Binario preparado en ${STAGED_BINARY}`);
+    return STAGED_BINARY;
+  } catch (error: unknown) {
+    // Sin binario ejecutable no hay nada que hacer, y fallar aquí con el motivo
+    // real es mucho más útil que un EACCES suelto a mitad de un trabajo.
+    throw new Error(
+      `No se pudo preparar el binario de ffmpeg. Origen: ${source}. ` +
+        `Causa: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }

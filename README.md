@@ -422,11 +422,24 @@ Las tres consecuencias que conviene tener presentes:
    lo hace la confirmación de la subida, lo hace el SSE mientras el usuario
    espera con la pestaña abierta, y como última red lo hace el cron.
 
-3. **El cron del plan Hobby corre una vez al día.** Suficiente para la limpieza
-   (rescatar trabajos atascados, barrido de retención), pero inservible como
-   planificador. Por eso el camino normal es el disparo directo. Con plan Pro se
-   puede bajar `schedule` en `vercel.json` a `*/5 * * * *` y el cron pasa a ser
-   también un planificador decente.
+3. **No hay cron configurado.** La ruta `/api/cron` existe y hace su trabajo
+   (rescatar trabajos atascados, barrido de retención), pero **no se declara en
+   `vercel.json`**: en plan Hobby los cron están limitados a 2 *por cuenta*, y
+   declarar uno más de la cuenta hace que Vercel rechace el despliegue entero
+   con un genérico *"project or build error"*, sin detalle en el log del build.
+
+   No es crítico, porque el camino normal para despertar el procesado es el
+   disparo directo desde la subida y desde el SSE. Para activarlo cuando haya
+   hueco (o con plan Pro), crea `vercel.json`:
+
+   ```json
+   { "crons": [{ "path": "/api/cron", "schedule": "0 4 * * *" }] }
+   ```
+
+   Con Pro se puede bajar a `*/5 * * * *` y el cron pasa a ser también un
+   planificador decente. Como alternativa sin cron de Vercel, cualquier
+   servicio externo puede llamar a `GET /api/cron` con la cabecera
+   `x-process-secret`.
 
 ### Coste
 
