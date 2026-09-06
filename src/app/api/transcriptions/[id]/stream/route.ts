@@ -156,7 +156,8 @@ export async function GET(request: Request, { params }: Params): Promise<Respons
 
           if (waiting && Date.now() - lastWakeAt >= WAKE_INTERVAL_MS) {
             lastWakeAt = Date.now();
-            void triggerProcessing();
+            console.log(`[sse] ${id} lleva en cola sin procesar; despertando al procesador`);
+            void triggerProcessing(`SSE observa ${id} en cola`);
           }
 
           if (TERMINAL_STATUSES.has(row.status)) {

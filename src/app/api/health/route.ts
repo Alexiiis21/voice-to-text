@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
-import { sql } from '@/db';
 import { blobConfigured } from '@/lib/blob';
-import { envPresence } from '@/lib/env';
+import { envPresence, missingImportant, missingRequired } from '@/lib/env-presence';
 import { ffmpegAvailable } from '@/lib/ffmpeg';
 
 export const runtime = 'nodejs';
@@ -13,33 +12,45 @@ export const dynamic = 'force-dynamic';
  *
  * Devuelve BOOLEANOS, jamás los valores (§5).
  *
- * Ojo: esta ruta **no lleva el binario de ffmpeg en su bundle** (ver
- * `outputFileTracingIncludes` en next.config.ts, que sólo lo incluye en las
- * rutas que lo ejecutan). En Vercel, por tanto, `ffmpeg: false` aquí es lo
- * esperado y no significa que el procesado esté roto. En un contenedor, donde
- * ffmpeg está en el PATH, sí da true.
+ * **Esta ruta no importa `@/lib/env` ni `@/db` en el nivel de módulo**, y es
+ * deliberado. Ambos construyen su estado al cargarse y lanzan si falta una
+ * variable obligatoria, así que importarlos aquí hacía que el health muriera
+ * exactamente en el escenario que tiene que diagnosticar: pasó de verdad al
+ * desaparecer `DATABASE_URL` del proyecto —la página daba 500, el health
+ * también, y no había forma de ver qué faltaba—. La conexión a la base se carga
+ * con un import dinámico dentro del `try`.
  */
 export async function GET(): Promise<NextResponse> {
+  const missing = missingRequired();
+
   let database = false;
   let databaseError: string | null = null;
 
-  try {
-    await sql`SELECT 1`;
-    database = true;
-  } catch (error: unknown) {
-    databaseError = error instanceof Error ? error.message : String(error);
+  if (missing.length > 0) {
+    databaseError = `Faltan variables obligatorias: ${missing.join(', ')}`;
+  } else {
+    try {
+      const { sql } = await import('@/db');
+      await sql`SELECT 1`;
+      database = true;
+    } catch (error: unknown) {
+      databaseError = error instanceof Error ? error.message : String(error);
+    }
   }
 
-  const binaries = await ffmpegAvailable();
+  // Ninguna de estas dos toca `env`, así que son seguras pase lo que pase.
   const blob = blobConfigured();
+  const binaries = await ffmpegAvailable().catch(() => ({ ffmpeg: false, path: '(sin resolver)' }));
 
-  // ffmpeg queda fuera del veredicto por lo dicho arriba: la salud que se puede
-  // comprobar desde aquí es la base de datos y el almacén.
-  const healthy = database && blob;
+  const healthy = missing.length === 0 && database && blob;
 
   return NextResponse.json(
     {
       status: healthy ? 'ok' : 'degraded',
+      // Lista accionable: qué hay que poner en el proyecto para que esto pase
+      // a 'ok'. Vacías cuando todo está en su sitio.
+      missingRequired: missing,
+      missingImportant: missingImportant(),
       database,
       databaseError,
       blob,

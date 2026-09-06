@@ -1,0 +1,27 @@
+# Qué NO se sube al desplegar con `vercel deploy`.
+#
+# Existe por un problema real: los ficheros `.env` locales acababan dentro del
+# despliegue. Dos consecuencias, las dos malas:
+#
+#   1. Las credenciales de desarrollo viajaban en el bundle en vez de quedarse
+#      en la máquina.
+#   2. Next carga esos ficheros en ejecución, así que una variable presente en
+#      el `.env` local pero borrada del proyecto de Vercel **seguía activa en
+#      producción**. Así se detectó: `DATA_DIR` se había eliminado del proyecto
+#      y `/api/health` la seguía reportando como presente.
+#
+# La configuración de producción son las variables del proyecto, y sólo esas.
+.env
+.env.*
+!.env.example
+
+# Artefactos de build: Vercel los regenera.
+.next
+dist
+node_modules
+
+# Nada de esto hace falta en el despliegue. `drizzle/` sí se sube: no se aplican
+# migraciones desde Vercel, pero excluirla no ahorra nada y sí sorprendería a
+# quien luego quiera ejecutarlas desde una función.
+.git
+tests

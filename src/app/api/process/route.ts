@@ -72,24 +72,43 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ error: 'No autorizado' }, { status: 401 });
   }
 
-  await ensureDataDirs();
+  const inicio = Date.now();
+
+  try {
+    await ensureDataDirs();
+  } catch (error: unknown) {
+    // Si el scratch no se puede crear, nada de lo que sigue va a funcionar.
+    // Merece un error explícito y no un fallo raro tres pasos más adelante.
+    const message = safeErrorMessage(error);
+    console.error(`[process] No se pudo preparar el directorio de trabajo: ${message}`);
+    return NextResponse.json({ error: `Scratch no disponible: ${message}` }, { status: 500 });
+  }
 
   const deadline = Date.now() + env.processBudgetMs;
   const stop = { stopped: (): boolean => Date.now() >= deadline };
 
   const outcome: Outcome = { processed: 0, deferred: 0, failed: 0, interrupted: false };
 
+  console.log(`[process] Invocación iniciada · presupuesto ${env.processBudgetMs} ms`);
+
   // Varios trabajos por invocación si sobra tiempo: un audio corto no merece
   // una invocación entera para él solo.
   while (!stop.stopped()) {
     const job = await repo.claimNextJob();
-    if (!job) break;
+    if (!job) {
+      if (outcome.processed + outcome.failed + outcome.deferred === 0) {
+        console.log('[process] No había nada que reclamar en la cola');
+      }
+      break;
+    }
 
     console.log(`[process] Reclamado ${job.id} (${job.filename})`);
+    const inicioJob = Date.now();
 
     try {
       await processJob(job, stop);
       outcome.processed += 1;
+      console.log(`[process] ${job.id} completado en ${Date.now() - inicioJob} ms`);
     } catch (error: unknown) {
       if (error instanceof JobInterrupted) {
         // Se acabó el presupuesto entre fragmentos. Vuelve a la cola con todo
@@ -117,11 +136,21 @@ export async function POST(request: Request): Promise<NextResponse> {
   // Encadenar si queda trabajo reclamable: o porque nos quedamos sin tiempo a
   // mitad, o porque entraron más audios mientras procesábamos éste.
   const pending = outcome.interrupted || (await repo.hasClaimableWork());
+
+  console.log(
+    `[process] Invocación terminada en ${Date.now() - inicio} ms · ` +
+      `procesados=${outcome.processed} aparcados=${outcome.deferred} ` +
+      `fallidos=${outcome.failed} interrumpido=${String(outcome.interrupted)} ` +
+      `encadena=${String(pending)}`,
+  );
+
   if (pending) {
     // `after` deja que la respuesta salga primero. Sin esto, el disparo compite
     // con el cierre de la invocación y se pierde a veces.
     after(async () => {
-      await triggerProcessing();
+      await triggerProcessing(
+        outcome.interrupted ? 'continuación tras fin de presupuesto' : 'queda cola pendiente',
+      );
     });
   }
 

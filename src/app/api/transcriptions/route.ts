@@ -118,9 +118,20 @@ export async function POST(request: Request): Promise<NextResponse> {
 
     if (!row) throw new Error('No se pudo crear el registro de la transcripción');
 
-    // Despertar al procesador. Es fire-and-forget: si se pierde, el cron lo
-    // recoge (ver src/lib/trigger.ts).
-    await triggerProcessing();
+    console.log(
+      `[api] Encolado ${row.id} · "${row.filename}" · ${Math.round(stat.size / 1024)} KB · ` +
+        `motor ${requestedProvider}`,
+    );
+
+    // Despertar al procesador. Si esto no consigue disparar, el trabajo se
+    // queda en `queued`: `triggerProcessing` lo registra con detalle.
+    const disparado = await triggerProcessing(`nueva transcripción ${row.id}`);
+    if (!disparado) {
+      console.error(
+        `[api] ${row.id} está encolado pero NADIE lo va a procesar. ` +
+          'Revisa el mensaje de [trigger] justo encima.',
+      );
+    }
 
     const quota = await readQuota(ip);
     return NextResponse.json({ id: row.id, transcription: toView(row), quota }, { status: 202 });

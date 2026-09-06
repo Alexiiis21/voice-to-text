@@ -173,6 +173,15 @@ function resolveAppUrl(): string | null {
   const vercelUrl = optional('VERCEL_URL');
   if (vercelUrl !== null) return `https://${vercelUrl}`;
 
+  // En desarrollo se apunta al propio servidor de Next. Sin esto, en local no
+  // hay forma de despertar a `/api/process`: la subida encolaba el trabajo, el
+  // disparo se caía en silencio por falta de URL y el audio se quedaba en
+  // `queued` sin un solo mensaje de error. Ahora `npm run dev` basta, y
+  // `npm run dev:worker` sigue siendo opcional.
+  if (process.env.NODE_ENV !== 'production') {
+    return `http://127.0.0.1:${process.env.PORT ?? '3000'}`;
+  }
+
   return null;
 }
 
@@ -215,23 +224,7 @@ export const env = {
   turnstileSecretKey: optional('TURNSTILE_SECRET_KEY'),
 } as const;
 
-/** Presencia de variables (booleanos, jamás los valores). Usado por /api/health. */
-export function envPresence(): Record<string, boolean> {
-  return {
-    DATABASE_URL: Boolean(process.env.DATABASE_URL),
-    DATA_DIR: Boolean(process.env.DATA_DIR),
-    BLOB_READ_WRITE_TOKEN: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
-    PROCESS_SECRET: Boolean(process.env.PROCESS_SECRET),
-    STT_PROVIDER: Boolean(process.env.STT_PROVIDER),
-    GROQ_API_KEY: Boolean(process.env.GROQ_API_KEY),
-    OPENAI_API_KEY: Boolean(process.env.OPENAI_API_KEY),
-    ANTHROPIC_API_KEY: Boolean(process.env.ANTHROPIC_API_KEY),
-    CLEANUP_MODEL: Boolean(process.env.CLEANUP_MODEL),
-    SUMMARY_MODEL: Boolean(process.env.SUMMARY_MODEL),
-    ENABLE_CLEANUP: Boolean(process.env.ENABLE_CLEANUP),
-    CHUNK_SECONDS: Boolean(process.env.CHUNK_SECONDS),
-    MAX_UPLOAD_MB: Boolean(process.env.MAX_UPLOAD_MB),
-    NEXT_PUBLIC_TURNSTILE_SITE_KEY: Boolean(process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY),
-    TURNSTILE_SECRET_KEY: Boolean(process.env.TURNSTILE_SECRET_KEY),
-  };
-}
+// `envPresence` vivía aquí, pero se ha movido a ./env-presence.ts. El motivo
+// está explicado en ese fichero: importarlo desde aquí arrastraba la
+// construcción de `env`, que lanza si falta una variable obligatoria, y eso
+// tumbaba a /api/health justo cuando tenía que diagnosticar esa falta.

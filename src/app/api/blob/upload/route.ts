@@ -78,6 +78,11 @@ export async function POST(request: Request): Promise<NextResponse> {
           throw new Error(decision.reason ?? 'Límite de uso alcanzado');
         }
 
+        console.log(
+          `[blob] Token emitido para "${payload.filename ?? pathname}" (${ext}), ` +
+            `máx ${env.maxUploadMb} MB`,
+        );
+
         return {
           allowedContentTypes: [...ALLOWED_MIME_TYPES],
           maximumSizeInBytes: env.maxUploadMb * 1024 * 1024,
@@ -87,11 +92,14 @@ export async function POST(request: Request): Promise<NextResponse> {
         };
       },
 
-      // El registro en base de datos lo crea el cliente con POST
-      // /api/transcriptions al terminar la subida. No se usa este callback
-      // porque Vercel no lo puede entregar a un `next dev` en localhost, y
-      // partir el flujo entre los dos caminos sólo traería divergencias.
-      onUploadCompleted: async () => {},
+      // `onUploadCompleted` se omite a propósito. El registro en base de datos
+      // lo crea el cliente con POST /api/transcriptions al terminar la subida,
+      // porque Vercel no puede entregar ese callback a un `next dev` en
+      // localhost y partir el flujo en dos caminos sólo traería divergencias.
+      //
+      // Declararlo vacío tampoco es gratis: el SDK exige entonces una
+      // `callbackUrl` y avisa en cada subida con
+      // "onUploadCompleted provided but no callbackUrl could be determined".
     });
 
     return NextResponse.json(result);

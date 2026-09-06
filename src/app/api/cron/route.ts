@@ -59,7 +59,7 @@ async function run(): Promise<NextResponse> {
     const swept = await maybeRunRetentionSweep();
 
     const pending = await repo.hasClaimableWork();
-    if (pending) await triggerProcessing();
+    if (pending) await triggerProcessing('cron encontró cola pendiente');
 
     return NextResponse.json({ requeued, swept, pending });
   } catch (error: unknown) {
