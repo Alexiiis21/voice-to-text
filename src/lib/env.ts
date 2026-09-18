@@ -197,6 +197,13 @@ export const env = {
    */
   processSecret: optional('PROCESS_SECRET'),
   /**
+   * Bypass de la Deployment Protection de Vercel, para que el disparo de
+   * `/api/process` atraviese el SSO. **No se define a mano**: lo inyecta Vercel
+   * en todos los despliegues al activar «Protection Bypass for Automation».
+   * Sin protección activada sobra, y entonces vale `null`. Ver ./trigger.ts.
+   */
+  automationBypassSecret: optional('VERCEL_AUTOMATION_BYPASS_SECRET'),
+  /**
    * Margen que se reserva antes del `maxDuration` de la función para cerrar el
    * trabajo con orden: guardar el fragmento en curso y encadenar la siguiente
    * invocación. Ver src/app/api/process/route.ts.

@@ -374,6 +374,24 @@ definir (por defecto usa el tmp del sistema, que es lo único escribible).
 `/api/process` queda abierta y cualquiera puede disparar la cola y quemar tu
 cuota de Groq. `/api/health` avisa con `processProtected: false`.
 
+### 6.3.1 Si tienes Deployment Protection activada
+
+Con **Vercel Authentication** encendida, todo lo que no lleve la cookie del SSO
+recibe un 401 **del edge, antes de ejecutar la función**. Desde el navegador no
+se nota —tú tienes la cookie—, pero el disparo que la app se hace a sí misma
+(`/api/transcriptions` → `/api/process`) va de servidor a servidor y no la
+tiene: el audio se encola y no lo procesa nadie hasta que pasa el cron diario.
+
+Se reconoce en los logs porque el 401 trae `Protected deployment`, y no el
+`{"error":"No autorizado"}` de la ruta. Dos salidas:
+
+- **Settings → Deployment Protection → Protection Bypass for Automation.**
+  Vercel genera el secreto y lo inyecta como `VERCEL_AUTOMATION_BYPASS_SECRET`;
+  `src/lib/trigger.ts` lo manda en `x-vercel-protection-bypass` sin más
+  configuración. Requiere redesplegar para que la variable entre en el build.
+- **Desactivar Vercel Authentication**, y dejar que `/api/process` se defienda
+  con `PROCESS_SECRET`, que es para lo que está.
+
 ### 6.4 Migraciones
 
 **Este es el paso que Vercel no hace por ti.** En el contenedor, las migraciones
